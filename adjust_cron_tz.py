@@ -92,6 +92,7 @@ Example ~/.crontab_src
 """
 
 import argparse
+import fcntl
 import math
 import random
 import re
@@ -374,7 +375,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", type=Path, default=META,
-                    help=f"Source file (default: {META})")
+                    help="Source file (default: ~/.crontab_src)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print generated crontab without installing it")
     args = ap.parse_args()
@@ -384,23 +385,37 @@ def main():
         print("Create it — see the docstring in this script for an example.", file=sys.stderr)
         sys.exit(1)
 
-    system_tz = _system_tz()
-    entries   = parse_source(args.src.read_text())
-    lines     = compile_crontab(entries, system_tz, args.src.resolve())
-    crontab   = "\n".join(lines) + "\n"
+    lock_path = Path(f"/tmp/adjust_cron_tz_{Path.home().name}.lock")
+    lock_fh   = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another instance is running; exiting.", file=sys.stderr)
+        sys.exit(0)
 
-    print(f"System timezone: {system_tz.key}")
-    print("Generated crontab:")
-    print("─" * 60)
-    print(crontab, end="")
-    print("─" * 60)
+    try:
+        system_tz = _system_tz()
+        # Read source while holding the lock so a concurrent edit doesn't tear the read.
+        src_text  = args.src.read_text()
+        entries   = parse_source(src_text)
+        lines     = compile_crontab(entries, system_tz, args.src.resolve())
+        crontab   = "\n".join(lines) + "\n"
 
-    if args.dry_run:
-        print("(dry run — not installed)")
-        return
+        print(f"System timezone: {system_tz.key}")
+        print("Generated crontab:")
+        print("─" * 60)
+        print(crontab, end="")
+        print("─" * 60)
 
-    subprocess.run(["crontab", "-"], input=crontab.encode(), check=True)
-    print("Installed.")
+        if args.dry_run:
+            print("(dry run — not installed)")
+            return
+
+        subprocess.run(["crontab", "-"], input=crontab.encode(), check=True)
+        print("Installed.")
+    finally:
+        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
 
 
 if __name__ == "__main__":
