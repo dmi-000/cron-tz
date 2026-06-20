@@ -6,24 +6,39 @@ Source of truth: ~/.crontab_src  (edit this, not crontab directly)
 Output: overwrites crontab via `crontab -`
 
 Run on wake, on network change, or daily to keep cron times current when
-the system timezone changes or to update sunset/sunrise times seasonally.
+the system timezone changes or to update solar times seasonally.
 
 Source file format
 ------------------
 Mostly looks like a crontab.  The first field of each line determines how
 it is treated — no other context matters:
 
-  HH:MM           → tz-aware fixed-time job (requires active # tz: directive)
-  HH:MM~N         → same, with up to N minutes of random jitter
-  sunrise[±M][~N] → tz-aware solar job      (requires # tz: and # lat/lon)
-  sunset[±M][~N]  → tz-aware solar job      (requires # tz: and # lat/lon)
-  anything else   → passed through to crontab unchanged (digit, *, @, KEY=, #)
+  HH:MM               → tz-aware fixed-time job (requires active # tz: directive)
+  HH:MM~N             → same, with up to N minutes of random jitter
+  solar_event[±M][~N] → tz-aware solar job      (requires # tz: and # lat/lon)
+  anything else       → passed through to crontab unchanged (digit, *, @, KEY=, #)
+
+Solar events (all require # lat/lon directives):
+
+  sunrise            → standard sunrise (sun at geometric horizon)
+  sunset             → standard sunset
+  civil_dawn         → sun 6° below horizon (start of civil twilight)
+  civil_dusk         → sun 6° below horizon (end of civil twilight)
+  nautical_dawn      → sun 12° below horizon
+  nautical_dusk      → sun 12° below horizon
+  astronomical_dawn  → sun 18° below horizon (true dark sky)
+  astronomical_dusk  → sun 18° below horizon
+  solarnoon          → solar noon (sun at highest point)
+
+All solar events accept an optional ±M minute offset and ~N jitter suffix:
+
+  civil_dawn-30~5 * * * python3 ~/bin/photography.py
 
 Standard 5-field cron lines are always raw, even inside a # tz: section.
 No closing directive is needed; # tz: only affects lines whose first field
-is HH:MM, sunrise, or sunset.
+is HH:MM or a solar event name.
 
-Three extensions over plain crontab:
+Three directive types extend plain crontab:
 
 1. Timezone/location directives in comments:
 
@@ -32,17 +47,31 @@ Three extensions over plain crontab:
 
    Apply to subsequent tz-aware jobs until overridden by another directive.
 
-2. Fixed-time jobs in the directive timezone (HH:MM replaces min+hour):
+2. Fixed-time and solar jobs (HH:MM or solar event replaces min+hour):
 
-     06:00 * * * python3 ~/bin/morning_job.py
+     06:00~5        * * *  python3 ~/bin/morning_job.py
+     sunset+30      * * *  python3 ~/bin/evening_job.py
+     astronomical_dusk * * * python3 ~/bin/astronomy.py
 
-3. Solar-time jobs (±M = minute offset, ~N = jitter up to N minutes):
+   Compiled to today's time; re-run this script daily to keep solar times current.
 
-     sunset+30    * * * python3 ~/bin/evening_job.py
-     sunrise-15~5 * * * python3 ~/bin/dawn_job.py
+3. Day filter directive:
 
-   Compiled to today's solar event time; re-run this script daily to keep
-   them current (sunset/sunrise drift ~1 min/day near solstices).
+     # filter: workday
+
+   Restricts which days subsequent tz-aware jobs run.  Options:
+
+     workday                              Mon–Fri (modifies crontab dow field)
+     weekend                              Sat–Sun (modifies crontab dow field)
+     last_dom                             last day of each month
+     nth_weekday:N,DOW                    Nth weekday of month (e.g. 2,Mon)
+     every_n_days:N,YYYY-MM-DD           every N days from reference date
+     between:YYYY-MM-DD,YYYY-MM-DD       date-range gate
+     none                                 clear filter (runs every day)
+
+   workday/weekend modify the crontab dow field directly.  The others wrap
+   the command in a python3 one-liner guard (requires python3 in PATH at
+   job runtime).  Filtered jobs exit 0 silently on non-matching days.
 
 Jitter
 ------
@@ -66,8 +95,9 @@ The generated crontab embeds each intended-time line as a comment:
 
      # tz: Europe/London
      # lat: 51.50  lon: -0.12
+     # filter: workday
      # [tz-src] 06:00 * * * python3 ~/bin/morning_job.py
-     0 6 * * * python3 ~/bin/morning_job.py
+     0 6 * * 1-5 python3 ~/bin/morning_job.py
 
 When the generated crontab is used as src, [tz-src] lines are parsed as
 the job source and the compiled line immediately following is skipped and
@@ -79,13 +109,17 @@ Example ~/.crontab_src
   SHELL=/bin/bash
   PATH=/usr/local/bin:/usr/bin:/bin
 
-  # recompile daily at 03:00 UTC to update sunset time
+  # recompile daily at 03:00 UTC to update solar times
   0 3 * * * python3 ~/bin/adjust_cron_tz.py
 
   # tz: Europe/London
   # lat: 51.50  lon: -0.12
-  06:00~5   * * *   python3 ~/bin/morning_job.py
-  sunset+30 * * *   python3 ~/bin/evening_job.py
+  # filter: workday
+  06:00~5        * * *  python3 ~/bin/morning_job.py
+
+  # filter: none
+  civil_dusk+15  * * *  python3 ~/bin/lights_on.py
+  sunset+30      * * *  python3 ~/bin/evening_job.py
 
   # UTC — raw lines pass through unchanged
   0 4 * * 0 /usr/bin/weekly-backup.sh
@@ -104,14 +138,42 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 META = Path("~/.crontab_src").expanduser()
 
-# First-field patterns for tz-aware jobs; group 3 captures optional ~N jitter
-_TIME_RE  = re.compile(r"^(\d{1,2}):(\d{2})(?:~(\d+))?$")
-_SOLAR_RE = re.compile(r"^(sunrise|sunset)([+-]\d+)?(?:~(\d+))?$")
+# First-field pattern for tz-aware fixed-time jobs; group 3 = optional ~N jitter
+_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})(?:~(\d+))?$")
+
+# Solar event names and their horizon elevation angles (degrees)
+_SOLAR_ELEVATION: dict[str, float] = {
+    "sunrise":             -0.833,
+    "sunset":              -0.833,
+    "civil_dawn":          -6.0,
+    "civil_dusk":          -6.0,
+    "nautical_dawn":      -12.0,
+    "nautical_dusk":      -12.0,
+    "astronomical_dawn":  -18.0,
+    "astronomical_dusk":  -18.0,
+}
+_SOLAR_RISE_EVENTS = frozenset(
+    {"sunrise", "civil_dawn", "nautical_dawn", "astronomical_dawn"}
+)
+# All solar event names (including solarnoon which has no elevation angle)
+_SOLAR_EVENT_NAMES = [
+    "astronomical_dawn", "astronomical_dusk",
+    "nautical_dawn", "nautical_dusk",
+    "civil_dawn", "civil_dusk",
+    "solarnoon",
+    "sunrise", "sunset",
+]
+_ALL_SOLAR_EVENTS = frozenset(_SOLAR_EVENT_NAMES)
+
+_SOLAR_RE = re.compile(
+    r"^(" + "|".join(_SOLAR_EVENT_NAMES) + r")([+-]\d+)?(?:~(\d+))?$"
+)
 
 # Directive patterns (searched anywhere in a comment line)
 _TZ_RE     = re.compile(r"\btz\s*:\s*(\S+)")
 _LAT_RE    = re.compile(r"\blat\s*:\s*(-?\d+(?:\.\d*)?)")
 _LON_RE    = re.compile(r"\blon\s*:\s*(-?\d+(?:\.\d*)?)")
+_FILTER_RE = re.compile(r"\bfilter\s*:\s*(\S+)")
 _TZ_SRC_RE = re.compile(r"^#\s*\[tz-src\]\s+(.+)$")
 
 _DAY_NAMES = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
@@ -121,23 +183,35 @@ _DAY_ABBR  = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 # ── Solar geometry ─────────────────────────────────────────────────────────────
 
 def _solar_event_utc(d: date, lat: float, lon: float, event: str) -> datetime:
-    """UTC datetime of sunrise or sunset at (lat, lon) on date d."""
+    """UTC datetime of a solar event at (lat, lon) on date d."""
     doy = d.timetuple().tm_yday
     B   = 2 * math.pi * (doy - 1) / 365
     decl = (0.006918 - 0.399912*math.cos(B) + 0.070257*math.sin(B)
             - 0.006758*math.cos(2*B) + 0.000907*math.sin(2*B)
             - 0.002697*math.cos(3*B) + 0.001480*math.sin(3*B))
-    cos_ha = -math.tan(math.radians(lat)) * math.tan(decl)
-    if cos_ha >= 1:
-        raise ValueError(f"polar night on {d} at lat={lat:.2f}")
-    if cos_ha <= -1:
-        raise ValueError(f"midnight sun on {d} at lat={lat:.2f}")
-    half_day_min = math.degrees(math.acos(cos_ha)) * 4
     eot_min = 229.18 * (0.000075 + 0.001868*math.cos(B) - 0.032077*math.sin(B)
                         - 0.014615*math.cos(2*B) - 0.04089*math.sin(2*B))
     noon_utc = (datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
                 + timedelta(minutes=720 - 4 * lon - eot_min))
-    return noon_utc + timedelta(minutes=half_day_min if event == "sunset" else -half_day_min)
+
+    if event == "solarnoon":
+        return noon_utc
+
+    h_deg    = _SOLAR_ELEVATION[event]
+    sin_lat  = math.sin(math.radians(lat))
+    cos_lat  = math.cos(math.radians(lat))
+    sin_decl = math.sin(decl)
+    cos_decl = math.cos(decl)
+    cos_ha   = (math.sin(math.radians(h_deg)) - sin_lat * sin_decl) / (cos_lat * cos_decl)
+
+    if cos_ha >= 1:
+        raise ValueError(f"no {event} on {d} at lat={lat:.2f} (polar night / deep winter)")
+    if cos_ha <= -1:
+        raise ValueError(f"no {event} on {d} at lat={lat:.2f} (midnight sun / permanent twilight)")
+
+    half_day_min = math.degrees(math.acos(cos_ha)) * 4
+    sign = -1 if event in _SOLAR_RISE_EVENTS else 1
+    return noon_utc + timedelta(minutes=sign * half_day_min)
 
 
 # ── System timezone ────────────────────────────────────────────────────────────
@@ -186,7 +260,6 @@ def _shift_dow(dow: str, delta: int) -> tuple[str, bool]:
         if "," in dow:
             return ",".join(shift_token(p) for p in dow.split(",")), True
         if re.search(r"[A-Za-z]", dow) and "-" in dow:
-            # named range like Mon-Fri
             a, b = dow.split("-", 1)
             return f"{shift_token(a)}-{shift_token(b)}", True
         if "-" in dow:
@@ -195,6 +268,66 @@ def _shift_dow(dow: str, delta: int) -> tuple[str, bool]:
         return shift_token(dow), True
     except (ValueError, IndexError):
         return dow, False
+
+
+# ── Day filter ─────────────────────────────────────────────────────────────────
+
+def _apply_day_filter(
+    days: str, filter_val: str | None, command: str
+) -> tuple[str, str, list[str]]:
+    """Return (new_days, new_command, warning_lines) after applying day filter."""
+    if not filter_val:
+        return days, command, []
+
+    dom, month, dow = days.split()
+
+    if filter_val == "workday":
+        return f"{dom} {month} 1-5", command, []
+
+    if filter_val == "weekend":
+        return f"{dom} {month} 0,6", command, []
+
+    if filter_val == "last_dom":
+        # Narrow dom to 28-31 (only candidates for last day) + python3 guard
+        guard = (
+            'python3 -c "import calendar,datetime; d=datetime.date.today(); '
+            'exit(0 if d.day==calendar.monthrange(d.year,d.month)[1] else 1)"'
+        )
+        return f"28-31 {month} {dow}", f"{guard} || exit 0; {command}", []
+
+    if filter_val.startswith("nth_weekday:"):
+        params = filter_val[len("nth_weekday:"):]
+        n_str, day_str = params.split(",", 1)
+        n = int(n_str)
+        day_low = day_str.strip().lower()
+        cron_dow = _DAY_NAMES[day_low] if day_low in _DAY_NAMES else int(day_str.strip()) % 7
+        dom_lo, dom_hi = (n - 1) * 7 + 1, n * 7
+        return f"{dom_lo}-{dom_hi} {month} {cron_dow}", command, []
+
+    if filter_val.startswith("every_n_days:"):
+        params = filter_val[len("every_n_days:"):]
+        n_str, ref_str = params.split(",", 1)
+        n, ref_str = int(n_str), ref_str.strip()
+        yr, mo, dy = ref_str.split("-")
+        guard = (
+            f'python3 -c "from datetime import date; t=date.today(); '
+            f'exit(0 if (t-date({int(yr)},{int(mo)},{int(dy)})).days%{n}==0 else 1)"'
+        )
+        return days, f"{guard} || exit 0; {command}", []
+
+    if filter_val.startswith("between:"):
+        params = filter_val[len("between:"):]
+        start_str, end_str = params.split(",", 1)
+        sy, sm, sd = start_str.strip().split("-")
+        ey, em, ed = end_str.strip().split("-")
+        guard = (
+            f'python3 -c "from datetime import date; t=date.today(); '
+            f'exit(0 if date({int(sy)},{int(sm)},{int(sd)})<=t<='
+            f'date({int(ey)},{int(em)},{int(ed)}) else 1)"'
+        )
+        return days, f"{guard} || exit 0; {command}", []
+
+    return days, command, [f"# WARNING: unknown filter {filter_val!r} — ignored"]
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────────
@@ -219,11 +352,11 @@ def _build_job_entry(parts: list[str], lineno: int,
     solar_m = _SOLAR_RE.match(first)
 
     entry: dict = {
-        "type":    "job",
+        "type":     "job",
         "timezone": current_tz,
-        "tz_obj":  tz,
-        "days":    " ".join(parts[1:4]),
-        "command": " ".join(parts[4:]),
+        "tz_obj":   tz,
+        "days":     " ".join(parts[1:4]),
+        "command":  " ".join(parts[4:]),
     }
     if time_m:
         entry["intended"] = f"{int(time_m.group(1)):02d}:{time_m.group(2)}"
@@ -241,10 +374,11 @@ def _build_job_entry(parts: list[str], lineno: int,
 
 def parse_source(text: str) -> list[dict]:
     """Parse a crontab_src file into a list of entry dicts."""
-    current_tz    = None
-    current_lat   = None
-    current_lon   = None
-    skip_next_job = False
+    current_tz     = None
+    current_lat    = None
+    current_lon    = None
+    current_filter = None
+    skip_next_job  = False
     entries = []
 
     for lineno, raw_line in enumerate(text.splitlines(), 1):
@@ -265,12 +399,17 @@ def parse_source(text: str) -> list[dict]:
             m = _LON_RE.search(stripped)
             if m:
                 current_lon = float(m.group(1))
+            m = _FILTER_RE.search(stripped)
+            if m:
+                val = m.group(1).lower()
+                current_filter = None if val in ("none", "off") else val
 
             m = _TZ_SRC_RE.match(stripped)
             if m:
                 src_parts = m.group(1).split()
                 job = _build_job_entry(src_parts, lineno,
                                        current_tz, current_lat, current_lon)
+                job["filter"] = current_filter
                 entries.append({"type": "comment", "text": line})
                 entries.append(job)
                 skip_next_job = True
@@ -293,6 +432,7 @@ def parse_source(text: str) -> list[dict]:
 
         if time_m or solar_m:
             job = _build_job_entry(parts, lineno, current_tz, current_lat, current_lon)
+            job["filter"] = current_filter
             entries.append({"type": "tz_src_comment", "tokens": parts})
             entries.append(job)
         else:
@@ -310,7 +450,7 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
     intended = entry["intended"]
     jitter   = entry.get("jitter_min", 0)
 
-    if intended in ("sunrise", "sunset"):
+    if intended in _ALL_SOLAR_EVENTS:
         lat = entry.get("lat")
         lon = entry.get("lon")
         if lat is None or lon is None:
@@ -347,7 +487,13 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
                 f"{system_tz.key}; dow field '{dow}' may need manual adjustment"
             )
 
-    return extra_comments + [f"{dt_local.minute} {dt_local.hour} {days} {entry['command']}"]
+    # Apply day filter
+    days, command, filter_warnings = _apply_day_filter(
+        days, entry.get("filter"), entry["command"]
+    )
+    extra_comments.extend(filter_warnings)
+
+    return extra_comments + [f"{dt_local.minute} {dt_local.hour} {days} {command}"]
 
 
 def compile_crontab(entries: list[dict], system_tz: ZoneInfo,
@@ -395,7 +541,6 @@ def main():
 
     try:
         system_tz = _system_tz()
-        # Read source while holding the lock so a concurrent edit doesn't tear the read.
         src_text  = args.src.read_text()
         entries   = parse_source(src_text)
         lines     = compile_crontab(entries, system_tz, args.src.resolve())
