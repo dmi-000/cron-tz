@@ -29,6 +29,28 @@ step syntax that crontab uses in its minute and hour fields:
 Each expanded time is converted through the timezone separately and emits
 its own cron line.
 
+Special day-of-month values
+---------------------------
+The dom field (first of the three day/month/dow fields) may use two
+extensions that standard crontab does not support:
+
+  Negative offsets from end of month:
+
+    18:00  -1  *  *    cmd   → last day of month
+    18:00  -2  *  *    cmd   → second-to-last day
+    18:00  -7  *  *    cmd   → seventh-to-last day
+
+  Ordinal weekday (dom = ordinal, dow = weekday name or 0–6):
+
+    09:00  first   *  monday   cmd   → first Monday of month
+    09:00  second  *  tuesday  cmd   → second Tuesday
+    09:00  third   *  Wed      cmd   → third Wednesday
+    09:00  fourth  *  4        cmd   → fourth Thursday (cron dow 4)
+    09:00  last    *  friday   cmd   → last Friday of month
+
+  first through fourth use the dom-range trick (no shell guard needed).
+  last, -1, -2, … wrap the command in a python3 guard.
+
 Solar events (all require # lat/lon directives):
 
   sunrise            → standard sunrise (sun at geometric horizon)
@@ -54,9 +76,12 @@ Three directive types extend plain crontab:
 1. Timezone/location directives in comments:
 
      # tz: Europe/London
+     # tz: local          ← use whatever timezone the system is currently in
      # lat: 51.50  lon: -0.12
 
    Apply to subsequent tz-aware jobs until overridden by another directive.
+   'local' re-resolves the system timezone on each compile run, so the
+   crontab stays correct if the machine moves or DST changes.
 
 2. Fixed-time and solar jobs (HH:MM or solar event replaces min+hour):
 
@@ -88,6 +113,10 @@ Three directive types extend plain crontab:
 
    The reference date in every_n_days is the phase: change it to shift
    which days the cycle lands on.
+
+   Note: workday/weekend/nth_weekday filters conflict with ordinal-weekday
+   dom specs (first/last/…) and will be ignored for those jobs with a
+   warning comment.
 
 Jitter
 ------
@@ -131,11 +160,12 @@ Example ~/.crontab_src
   # tz: Europe/London
   # lat: 51.50  lon: -0.12
   # filter: workday
-  06:00~5        * * *  python3 ~/bin/morning_job.py
+  06:00~5        * * *   python3 ~/bin/morning_job.py
 
   # filter: none
-  civil_dusk+15  * * *  python3 ~/bin/lights_on.py
-  sunset+30      * * *  python3 ~/bin/evening_job.py
+  18:00  last  *  friday  python3 ~/bin/end_of_month_review.py
+  civil_dusk+15  * * *   python3 ~/bin/lights_on.py
+  sunset+30      * * *   python3 ~/bin/evening_job.py
 
   # UTC — raw lines pass through unchanged
   0 4 * * 0 /usr/bin/weekly-backup.sh
@@ -197,8 +227,20 @@ _FILTER_TYPO_RE = re.compile(
     r"\bfilter\s+(?:workday|weekend|last_dom|nth_weekday|every_n_days|between|none|off)\b"
 )
 
-_DAY_NAMES = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+_DAY_NAMES = {
+    # 3-letter abbreviations (canonical cron form)
+    "sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
+    # Full names
+    "sunday": 0, "monday": 1, "tuesday": 2, "wednesday": 3,
+    "thursday": 4, "friday": 5, "saturday": 6,
+}
 _DAY_ABBR  = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+# Ordinal dom keywords; value = n for nth (1-4) or 0 for last
+_ORDINAL_NAMES = {"first": 1, "second": 2, "third": 3, "fourth": 4, "last": 0}
+
+# Filters that override the crontab dow field (conflict with ordinal-weekday dom)
+_DOW_FILTERS = {"workday", "weekend"}
 
 
 # ── Solar geometry ─────────────────────────────────────────────────────────────
@@ -325,25 +367,98 @@ def _shift_dow(dow: str, delta: int) -> tuple[str, bool]:
         return dow, False
 
 
+# ── Special dom expansion ──────────────────────────────────────────────────────
+
+def _expand_dom_spec(
+    dom: str, month: str, dow: str, command: str
+) -> tuple[str, str, str, str, bool, list[str]]:
+    """Expand special dom values.
+
+    Returns (dom, month, dow, command, dow_was_set, warnings).
+    dow_was_set=True means dom expansion fixed the weekday; dow-modifying
+    filters should back off and warn instead of overriding it.
+    """
+
+    # Negative offset from end of month: -1 = last day, -2 = 2nd to last, …
+    if re.match(r"^-\d+$", dom):
+        N = int(dom)                           # e.g. -1
+        dom_lo = max(1, 29 + N)               # narrowest safe range
+        dom_hi = min(31, 32 + N)
+        # Guard: today is the |N|-th day from end of month
+        offset = -N - 1                        # 0 = last day, 1 = 2nd to last …
+        rhs = "calendar.monthrange(d.year,d.month)[1]" + (f"-{offset}" if offset else "")
+        guard = (
+            f'python3 -c "import calendar,datetime; d=datetime.date.today(); '
+            f'exit(0 if d.day=={rhs} else 1)"'
+        )
+        return (f"{dom_lo}-{dom_hi}", month, dow,
+                f"{guard} || exit 0; {command}", False, [])
+
+    # Ordinal weekday: first/second/third/fourth/last in dom, weekday in dow
+    dom_low = dom.lower()
+    if dom_low in _ORDINAL_NAMES:
+        dow_low = dow.lower()
+        if dow_low in _DAY_NAMES:
+            cron_dow = _DAY_NAMES[dow_low]
+        elif re.match(r"^\d+$", dow):
+            cron_dow = int(dow) % 7
+        else:
+            return (dom, month, dow, command, False, [
+                f"# WARNING: ordinal dom '{dom}' requires a weekday name or 0–6 "
+                f"in the dow field, got {dow!r}"
+            ])
+
+        n = _ORDINAL_NAMES[dom_low]
+        if n >= 1:                             # first … fourth: dom range trick
+            dom_lo, dom_hi = (n - 1) * 7 + 1, n * 7
+            return (f"{dom_lo}-{dom_hi}", month, str(cron_dow),
+                    command, True, [])
+        else:                                  # last: guard needed
+            # python weekday: 0=Mon … 6=Sun; cron dow: 0=Sun, 1=Mon … 6=Sat
+            python_wd = (cron_dow - 1) % 7
+            guard = (
+                f'python3 -c "from datetime import date,timedelta; d=date.today(); '
+                f'exit(0 if d.weekday()=={python_wd}'
+                f' and (d+timedelta(7)).month!=d.month else 1)"'
+            )
+            return ("22-31", month, str(cron_dow),
+                    f"{guard} || exit 0; {command}", True, [])
+
+    return dom, month, dow, command, False, []
+
+
 # ── Day filter ─────────────────────────────────────────────────────────────────
 
 def _apply_day_filter(
-    days: str, filter_val: str | None, command: str
+    days: str, filter_val: str | None, command: str, dow_locked: bool = False
 ) -> tuple[str, str, list[str]]:
-    """Return (new_days, new_command, warning_lines) after applying day filter."""
+    """Return (new_days, new_command, warning_lines) after applying day filter.
+
+    dow_locked=True means the dom spec already fixed the weekday; filters that
+    would override the dow field emit a warning instead.
+    """
     if not filter_val:
         return days, command, []
 
     dom, month, dow = days.split()
 
+    def dow_conflict(filter_name: str) -> tuple[str, str, list[str]]:
+        return days, command, [
+            f"# WARNING: '{filter_name}' filter conflicts with ordinal-weekday "
+            f"dom spec and was ignored"
+        ]
+
     if filter_val == "workday":
+        if dow_locked:
+            return dow_conflict("workday")
         return f"{dom} {month} 1-5", command, []
 
     if filter_val == "weekend":
+        if dow_locked:
+            return dow_conflict("weekend")
         return f"{dom} {month} 0,6", command, []
 
     if filter_val == "last_dom":
-        # Narrow dom to 28-31 (only candidates for last day) + python3 guard
         guard = (
             'python3 -c "import calendar,datetime; d=datetime.date.today(); '
             'exit(0 if d.day==calendar.monthrange(d.year,d.month)[1] else 1)"'
@@ -351,6 +466,8 @@ def _apply_day_filter(
         return f"28-31 {month} {dow}", f"{guard} || exit 0; {command}", []
 
     if filter_val.startswith("nth_weekday:"):
+        if dow_locked:
+            return dow_conflict("nth_weekday")
         params = filter_val[len("nth_weekday:"):]
         try:
             n_str, day_str = params.split(",", 1)
@@ -415,10 +532,13 @@ def _build_job_entry(parts: list[str], lineno: int,
                          f"'time dom month dow command', got {' '.join(parts)!r}")
     if current_tz is None:
         raise ValueError(f"line {lineno}: no '# tz: ...' directive before tz-aware job")
-    try:
-        tz = ZoneInfo(current_tz)
-    except ZoneInfoNotFoundError:
-        raise ValueError(f"line {lineno}: unknown timezone {current_tz!r}")
+    if current_tz.lower() == "local":
+        tz = None   # resolved at compile time from system_tz
+    else:
+        try:
+            tz = ZoneInfo(current_tz)
+        except ZoneInfoNotFoundError:
+            raise ValueError(f"line {lineno}: unknown timezone {current_tz!r}")
 
     first   = parts[0]
     time_m  = _TIME_RE.match(first)
@@ -523,13 +643,13 @@ def parse_source(text: str) -> list[dict]:
 def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
     """Return a list of lines: optional warning/info comments + cron line(s)."""
     today      = datetime.now(tz=system_tz).date()
-    tz         = entry["tz_obj"]
+    tz         = entry["tz_obj"] or system_tz   # None means # tz: local
     intended   = entry["intended"]
     jitter     = entry.get("jitter_min", 0)
     days_base  = entry["days"]
     filter_val = entry.get("filter")
 
-    # Build list of (dt_local,) for each expanded time
+    # Build list of local datetimes for each expanded time
     if intended in _ALL_SOLAR_EVENTS:
         lat = entry.get("lat")
         lon = entry.get("lon")
@@ -562,6 +682,7 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
         days = days_base
         extra: list[str] = []
 
+        # Midnight-crossing dow adjustment
         if day_delta != 0:
             dom, month, dow = days.split()
             new_dow, ok = _shift_dow(dow, day_delta)
@@ -577,8 +698,20 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
                     f"{system_tz.key}; dow field '{days.split()[2]}' may need manual adjustment"
                 )
 
-        days, command, filter_warn = _apply_day_filter(days, filter_val, entry["command"])
-        extra.extend(filter_warn)
+        # Special dom expansion (ordinal weekdays, negative offsets)
+        dom, month, dow = days.split()
+        dom, month, dow, command, dow_locked, dom_warnings = _expand_dom_spec(
+            dom, month, dow, entry["command"]
+        )
+        days = f"{dom} {month} {dow}"
+        extra.extend(dom_warnings)
+
+        # Day filter
+        days, command, filter_warnings = _apply_day_filter(
+            days, filter_val, command, dow_locked=dow_locked
+        )
+        extra.extend(filter_warnings)
+
         result_lines.extend(extra + [f"{dt_local.minute} {dt_local.hour} {days} {command}"])
 
     return result_lines
