@@ -18,6 +18,17 @@ it is treated — no other context matters:
   solar_event[±M][~N] → tz-aware solar job      (requires # tz: and # lat/lon)
   anything else       → passed through to crontab unchanged (digit, *, @, KEY=, #)
 
+The HH and MM parts of a fixed-time spec accept the same range, list, and
+step syntax that crontab uses in its minute and hour fields:
+
+  09:00,30     * * *  cmd        → two jobs (09:00 and 09:30)
+  9,17:00      * * *  cmd        → two jobs (09:00 and 17:00)
+  9-17/2:00    * * *  cmd        → jobs at 09:00, 11:00, 13:00, 15:00, 17:00
+  */4:00       * * *  cmd        → jobs at 00:00, 04:00, 08:00 … 20:00
+
+Each expanded time is converted through the timezone separately and emits
+its own cron line.
+
 Solar events (all require # lat/lon directives):
 
   sunrise            → standard sunrise (sun at geometric horizon)
@@ -59,7 +70,9 @@ Three directive types extend plain crontab:
 
      # filter: workday
 
-   Restricts which days subsequent tz-aware jobs run.  Options:
+   Restricts which days subsequent tz-aware jobs run.  Scope is sticky —
+   applies to all following jobs until overridden by another # filter: or
+   cleared with # filter: none.  Options:
 
      workday                              Mon–Fri (modifies crontab dow field)
      weekend                              Sat–Sun (modifies crontab dow field)
@@ -72,6 +85,9 @@ Three directive types extend plain crontab:
    workday/weekend modify the crontab dow field directly.  The others wrap
    the command in a python3 one-liner guard (requires python3 in PATH at
    job runtime).  Filtered jobs exit 0 silently on non-matching days.
+
+   The reference date in every_n_days is the phase: change it to shift
+   which days the cycle lands on.
 
 Jitter
 ------
@@ -138,8 +154,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 META = Path("~/.crontab_src").expanduser()
 
-# First-field pattern for tz-aware fixed-time jobs; group 3 = optional ~N jitter
-_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})(?:~(\d+))?$")
+# First-field pattern for tz-aware fixed-time jobs.
+# HH and MM may be crontab field expressions (digits, *, , - /).
+_TIME_RE = re.compile(r"^([\d*,/\-]+):([\d*,/\-]+)(?:~(\d+))?$")
 
 # Solar event names and their horizon elevation angles (degrees)
 _SOLAR_ELEVATION: dict[str, float] = {
@@ -155,7 +172,6 @@ _SOLAR_ELEVATION: dict[str, float] = {
 _SOLAR_RISE_EVENTS = frozenset(
     {"sunrise", "civil_dawn", "nautical_dawn", "astronomical_dawn"}
 )
-# All solar event names (including solarnoon which has no elevation angle)
 _SOLAR_EVENT_NAMES = [
     "astronomical_dawn", "astronomical_dusk",
     "nautical_dawn", "nautical_dusk",
@@ -175,6 +191,11 @@ _LAT_RE    = re.compile(r"\blat\s*:\s*(-?\d+(?:\.\d*)?)")
 _LON_RE    = re.compile(r"\blon\s*:\s*(-?\d+(?:\.\d*)?)")
 _FILTER_RE = re.compile(r"\bfilter\s*:\s*(\S+)")
 _TZ_SRC_RE = re.compile(r"^#\s*\[tz-src\]\s+(.+)$")
+
+# Heuristic to catch '# filter keyword' with a missing colon
+_FILTER_TYPO_RE = re.compile(
+    r"\bfilter\s+(?:workday|weekend|last_dom|nth_weekday|every_n_days|between|none|off)\b"
+)
 
 _DAY_NAMES = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
 _DAY_ABBR  = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -212,6 +233,40 @@ def _solar_event_utc(d: date, lat: float, lon: float, event: str) -> datetime:
     half_day_min = math.degrees(math.acos(cos_ha)) * 4
     sign = -1 if event in _SOLAR_RISE_EVENTS else 1
     return noon_utc + timedelta(minutes=sign * half_day_min)
+
+
+# ── Crontab field expansion ────────────────────────────────────────────────────
+
+def _expand_cron_field(expr: str, lo: int, hi: int) -> list[int]:
+    """Expand a crontab field expression to a sorted list of integers.
+    Supports: N, *, N-M, */S, N-M/S, and comma-separated combinations."""
+    result: set[int] = set()
+    for part in expr.split(","):
+        part = part.strip()
+        if "/" in part:
+            base, step_s = part.rsplit("/", 1)
+            step = int(step_s)
+            if step < 1:
+                raise ValueError(f"step must be >= 1, got {step}")
+            if base == "*":
+                result.update(range(lo, hi + 1, step))
+            elif "-" in base:
+                a, b = base.split("-", 1)
+                result.update(range(int(a), int(b) + 1, step))
+            else:
+                result.update(range(int(base), hi + 1, step))
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            result.update(range(int(a), int(b) + 1))
+        elif part == "*":
+            result.update(range(lo, hi + 1))
+        else:
+            result.add(int(part))
+    out = sorted(result)
+    for v in out:
+        if not (lo <= v <= hi):
+            raise ValueError(f"value {v} out of range [{lo},{hi}] in {expr!r}")
+    return out
 
 
 # ── System timezone ────────────────────────────────────────────────────────────
@@ -297,18 +352,28 @@ def _apply_day_filter(
 
     if filter_val.startswith("nth_weekday:"):
         params = filter_val[len("nth_weekday:"):]
-        n_str, day_str = params.split(",", 1)
-        n = int(n_str)
-        day_low = day_str.strip().lower()
-        cron_dow = _DAY_NAMES[day_low] if day_low in _DAY_NAMES else int(day_str.strip()) % 7
-        dom_lo, dom_hi = (n - 1) * 7 + 1, n * 7
+        try:
+            n_str, day_str = params.split(",", 1)
+            n = int(n_str)
+            day_low = day_str.strip().lower()
+            cron_dow = _DAY_NAMES[day_low] if day_low in _DAY_NAMES else int(day_str.strip()) % 7
+            dom_lo, dom_hi = (n - 1) * 7 + 1, n * 7
+        except (ValueError, KeyError) as e:
+            return days, command, [f"# WARNING: malformed nth_weekday filter {filter_val!r}: {e}"]
         return f"{dom_lo}-{dom_hi} {month} {cron_dow}", command, []
 
     if filter_val.startswith("every_n_days:"):
         params = filter_val[len("every_n_days:"):]
-        n_str, ref_str = params.split(",", 1)
-        n, ref_str = int(n_str), ref_str.strip()
-        yr, mo, dy = ref_str.split("-")
+        try:
+            n_str, ref_str = params.split(",", 1)
+            n, ref_str = int(n_str), ref_str.strip()
+            yr, mo, dy = ref_str.split("-")
+            _ = date(int(yr), int(mo), int(dy))   # validate
+        except (ValueError, TypeError) as e:
+            return days, command, [
+                f"# WARNING: malformed every_n_days filter {filter_val!r}: {e}",
+                f"# Expected format: every_n_days:N,YYYY-MM-DD",
+            ]
         guard = (
             f'python3 -c "from datetime import date; t=date.today(); '
             f'exit(0 if (t-date({int(yr)},{int(mo)},{int(dy)})).days%{n}==0 else 1)"'
@@ -317,9 +382,17 @@ def _apply_day_filter(
 
     if filter_val.startswith("between:"):
         params = filter_val[len("between:"):]
-        start_str, end_str = params.split(",", 1)
-        sy, sm, sd = start_str.strip().split("-")
-        ey, em, ed = end_str.strip().split("-")
+        try:
+            start_str, end_str = params.split(",", 1)
+            sy, sm, sd = start_str.strip().split("-")
+            ey, em, ed = end_str.strip().split("-")
+            _ = date(int(sy), int(sm), int(sd))   # validate
+            _ = date(int(ey), int(em), int(ed))
+        except (ValueError, TypeError) as e:
+            return days, command, [
+                f"# WARNING: malformed between filter {filter_val!r}: {e}",
+                f"# Expected format: between:YYYY-MM-DD,YYYY-MM-DD",
+            ]
         guard = (
             f'python3 -c "from datetime import date; t=date.today(); '
             f'exit(0 if date({int(sy)},{int(sm)},{int(sd)})<=t<='
@@ -359,7 +432,8 @@ def _build_job_entry(parts: list[str], lineno: int,
         "command":  " ".join(parts[4:]),
     }
     if time_m:
-        entry["intended"] = f"{int(time_m.group(1)):02d}:{time_m.group(2)}"
+        # Store raw expression (may be multi-time like '9,17:00')
+        entry["intended"] = f"{time_m.group(1)}:{time_m.group(2)}"
         if time_m.group(3):
             entry["jitter_min"] = int(time_m.group(3))
     elif solar_m:
@@ -403,6 +477,9 @@ def parse_source(text: str) -> list[dict]:
             if m:
                 val = m.group(1).lower()
                 current_filter = None if val in ("none", "off") else val
+            elif _FILTER_TYPO_RE.search(stripped):
+                print(f"WARNING line {lineno}: looks like a malformed filter directive "
+                      f"(missing colon after 'filter'?): {stripped!r}", file=sys.stderr)
 
             m = _TZ_SRC_RE.match(stripped)
             if m:
@@ -444,12 +521,15 @@ def parse_source(text: str) -> list[dict]:
 # ── Compiler ───────────────────────────────────────────────────────────────────
 
 def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
-    """Return a list of lines: optional warning/info comments + the cron line."""
-    today    = datetime.now(tz=system_tz).date()
-    tz       = entry["tz_obj"]
-    intended = entry["intended"]
-    jitter   = entry.get("jitter_min", 0)
+    """Return a list of lines: optional warning/info comments + cron line(s)."""
+    today      = datetime.now(tz=system_tz).date()
+    tz         = entry["tz_obj"]
+    intended   = entry["intended"]
+    jitter     = entry.get("jitter_min", 0)
+    days_base  = entry["days"]
+    filter_val = entry.get("filter")
 
+    # Build list of (dt_local,) for each expanded time
     if intended in _ALL_SOLAR_EVENTS:
         lat = entry.get("lat")
         lon = entry.get("lon")
@@ -459,41 +539,49 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
         dt_utc += timedelta(minutes=entry.get("offset_min", 0))
         if jitter:
             dt_utc += timedelta(minutes=random.randint(0, jitter))
-        dt_local = dt_utc.astimezone(system_tz)
+        local_times = [dt_utc.astimezone(system_tz)]
     else:
-        hh, mm   = map(int, intended.split(":"))
-        dt_local = datetime(today.year, today.month, today.day, hh, mm,
-                            tzinfo=tz).astimezone(system_tz)
-        if jitter:
-            dt_local = dt_local + timedelta(minutes=random.randint(0, jitter))
+        hh_expr, mm_expr = intended.split(":", 1)
+        try:
+            hh_vals = _expand_cron_field(hh_expr, 0, 23)
+            mm_vals = _expand_cron_field(mm_expr, 0, 59)
+        except ValueError as e:
+            raise ValueError(f"invalid time spec {intended!r}: {e}") from e
+        local_times = []
+        for hh in hh_vals:
+            for mm in mm_vals:
+                dt_local = datetime(today.year, today.month, today.day, hh, mm,
+                                    tzinfo=tz).astimezone(system_tz)
+                if jitter:
+                    dt_local += timedelta(minutes=random.randint(0, jitter))
+                local_times.append(dt_local)
 
-    # Adjust dow if the time conversion crossed midnight
-    day_delta = (dt_local.date() - today).days
-    days = entry["days"]
-    extra_comments: list[str] = []
+    result_lines: list[str] = []
+    for dt_local in local_times:
+        day_delta = (dt_local.date() - today).days
+        days = days_base
+        extra: list[str] = []
 
-    if day_delta != 0:
-        dom, month, dow = days.split()
-        new_dow, ok = _shift_dow(dow, day_delta)
-        if ok and new_dow != dow:
-            extra_comments.append(
-                f"# dow shifted {day_delta:+d} ({intended} {entry['timezone']} "
-                f"→ {dt_local.strftime('%H:%M')} {system_tz.key}, crosses midnight)"
-            )
-            days = f"{dom} {month} {new_dow}"
-        elif not ok:
-            extra_comments.append(
-                f"# WARNING: {intended} {entry['timezone']} crosses midnight into "
-                f"{system_tz.key}; dow field '{dow}' may need manual adjustment"
-            )
+        if day_delta != 0:
+            dom, month, dow = days.split()
+            new_dow, ok = _shift_dow(dow, day_delta)
+            if ok and new_dow != dow:
+                extra.append(
+                    f"# dow shifted {day_delta:+d} ({intended} {entry['timezone']} "
+                    f"→ {dt_local.strftime('%H:%M')} {system_tz.key}, crosses midnight)"
+                )
+                days = f"{dom} {month} {new_dow}"
+            elif not ok:
+                extra.append(
+                    f"# WARNING: {intended} {entry['timezone']} crosses midnight into "
+                    f"{system_tz.key}; dow field '{days.split()[2]}' may need manual adjustment"
+                )
 
-    # Apply day filter
-    days, command, filter_warnings = _apply_day_filter(
-        days, entry.get("filter"), entry["command"]
-    )
-    extra_comments.extend(filter_warnings)
+        days, command, filter_warn = _apply_day_filter(days, filter_val, entry["command"])
+        extra.extend(filter_warn)
+        result_lines.extend(extra + [f"{dt_local.minute} {dt_local.hour} {days} {command}"])
 
-    return extra_comments + [f"{dt_local.minute} {dt_local.hour} {days} {command}"]
+    return result_lines
 
 
 def compile_crontab(entries: list[dict], system_tz: ZoneInfo,
