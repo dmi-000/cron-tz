@@ -215,6 +215,16 @@ _SOLAR_RE = re.compile(
     r"^(" + "|".join(_SOLAR_EVENT_NAMES) + r")([+-]\d+)?(?:~(\d+))?$"
 )
 
+# Solar range: event1[±off]-event2[±off]/N(m|h)[~jitter]
+# Step must carry a unit (m=minutes, h=hours) to avoid ambiguity with crontab step syntax.
+# Examples: civil_dawn-civil_dusk/1h  sunrise-sunset/30m  sunrise+30-sunset-30/2h~5
+_SOLAR_RANGE_RE = re.compile(
+    r"^(" + "|".join(_SOLAR_EVENT_NAMES) + r")([+-]\d+)?"
+    r"-(" + "|".join(_SOLAR_EVENT_NAMES) + r")([+-]\d+)?"
+    r"/(\d+)(m|h)"
+    r"(?:~(\d+))?$"
+)
+
 # Directive patterns (searched anywhere in a comment line)
 _TZ_RE     = re.compile(r"\btz\s*:\s*(\S+)")
 _LAT_RE    = re.compile(r"\blat\s*:\s*(-?\d+(?:\.\d*)?)")
@@ -227,6 +237,30 @@ _FILTER_TYPO_RE = re.compile(
     r"\bfilter\s+(?:workday|weekend|last_dom|nth_weekday|every_n_days|between|none|off)\b"
 )
 
+# Crontab field patterns.
+# min/hour fields accept only numeric expressions (no names); dom/month/dow allow names.
+_CRON_NUM_FIELD_RE  = re.compile(r'^[0-9*,/\-]+$')
+_CRON_FIELD_RE      = re.compile(r'^[0-9a-zA-Z*,/\-]+$')
+_CRON_SPECIALS = frozenset([
+    "@reboot", "@yearly", "@annually", "@monthly",
+    "@weekly", "@daily", "@midnight", "@hourly",
+])
+
+
+def _is_valid_crontab_line(parts: list[str]) -> bool:
+    """Return True if parts looks like a valid standard crontab line."""
+    if not parts:
+        return False
+    if parts[0].startswith("@"):
+        return parts[0].lower() in _CRON_SPECIALS and len(parts) >= 2
+    if len(parts) < 6:
+        return False
+    # min, hour: digits/*,/- only (no names — catches e.g. 'sunrise-sunset/2' as minute)
+    if not (_CRON_NUM_FIELD_RE.match(parts[0]) and _CRON_NUM_FIELD_RE.match(parts[1])):
+        return False
+    # dom, month, dow: allow named values (JAN, MON, etc.)
+    return all(_CRON_FIELD_RE.match(f) for f in parts[2:5])
+
 _DAY_NAMES = {
     # 3-letter abbreviations (canonical cron form)
     "sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
@@ -236,8 +270,19 @@ _DAY_NAMES = {
 }
 _DAY_ABBR  = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-# Ordinal dom keywords; value = n for nth (1-4) or 0 for last
-_ORDINAL_NAMES = {"first": 1, "second": 2, "third": 3, "fourth": 4, "last": 0}
+# Ordinal dom keywords; value = n for nth (1-5) or 0 for last.
+# Numeric forms (1st/2nd/…/5th) and -1st/-1th are accepted as synonyms.
+# 5th uses dom range 29-31 (clamped from 35); fires only on months with a 5th occurrence.
+# -1st/-1th mean last weekday of month (same as the word 'last'), NOT last day of month
+# (for last day of month use -1 in the dom field).
+_ORDINAL_NAMES = {
+    "first":  1, "1st": 1,
+    "second": 2, "2nd": 2,
+    "third":  3, "3rd": 3,
+    "fourth": 4, "4th": 4,
+    "fifth":  5, "5th": 5,
+    "last":   0, "-1st": 0, "-1th": 0,
+}
 
 # Filters that override the crontab dow field (conflict with ordinal-weekday dom)
 _DOW_FILTERS = {"workday", "weekend"}
@@ -382,6 +427,10 @@ def _expand_dom_spec(
     # Negative offset from end of month: -1 = last day, -2 = 2nd to last, …
     if re.match(r"^-\d+$", dom):
         N = int(dom)                           # e.g. -1
+        if N <= -32:
+            return (dom, month, dow, command, False, [
+                f"# WARNING: dom '{dom}' can never match — no month has {-N} or more days"
+            ])
         dom_lo = max(1, 29 + N)               # narrowest safe range
         dom_hi = min(31, 32 + N)
         # Guard: today is the |N|-th day from end of month
@@ -409,8 +458,9 @@ def _expand_dom_spec(
             ])
 
         n = _ORDINAL_NAMES[dom_low]
-        if n >= 1:                             # first … fourth: dom range trick
-            dom_lo, dom_hi = (n - 1) * 7 + 1, n * 7
+        if n >= 1:                             # first … fifth: dom range trick
+            dom_lo = (n - 1) * 7 + 1
+            dom_hi = min(n * 7, 31)           # 5th: 35 → 31; fires only if month has 5th occurrence
             return (f"{dom_lo}-{dom_hi}", month, str(cron_dow),
                     command, True, [])
         else:                                  # last: guard needed
@@ -491,9 +541,10 @@ def _apply_day_filter(
                 f"# WARNING: malformed every_n_days filter {filter_val!r}: {e}",
                 f"# Expected format: every_n_days:N,YYYY-MM-DD",
             ]
+        # Use d-d//n*n instead of d%n — cron treats bare % as a metacharacter
         guard = (
             f'python3 -c "from datetime import date; t=date.today(); '
-            f'exit(0 if (t-date({int(yr)},{int(mo)},{int(dy)})).days%{n}==0 else 1)"'
+            f'd=(t-date({int(yr)},{int(mo)},{int(dy)})).days; exit(d-d//{n}*{n})"'
         )
         return days, f"{guard} || exit 0; {command}", []
 
@@ -543,6 +594,7 @@ def _build_job_entry(parts: list[str], lineno: int,
     first   = parts[0]
     time_m  = _TIME_RE.match(first)
     solar_m = _SOLAR_RE.match(first)
+    range_m = _SOLAR_RANGE_RE.match(first)
 
     entry: dict = {
         "type":     "job",
@@ -561,6 +613,19 @@ def _build_job_entry(parts: list[str], lineno: int,
         entry["offset_min"] = int(solar_m.group(2)) if solar_m.group(2) else 0
         if solar_m.group(3):
             entry["jitter_min"] = int(solar_m.group(3))
+        entry["lat"] = current_lat
+        entry["lon"] = current_lon
+    elif range_m:
+        unit = range_m.group(6)
+        step_min = int(range_m.group(5)) * (60 if unit == "h" else 1)
+        entry["intended"]       = "solar_range"
+        entry["range_event1"]   = range_m.group(1)
+        entry["range_offset1"]  = int(range_m.group(2)) if range_m.group(2) else 0
+        entry["range_event2"]   = range_m.group(3)
+        entry["range_offset2"]  = int(range_m.group(4)) if range_m.group(4) else 0
+        entry["range_step_min"] = step_min
+        if range_m.group(7):
+            entry["jitter_min"] = int(range_m.group(7))
         entry["lat"] = current_lat
         entry["lon"] = current_lon
     return entry
@@ -626,13 +691,24 @@ def parse_source(text: str) -> list[dict]:
         first   = parts[0] if parts else ""
         time_m  = _TIME_RE.match(first)
         solar_m = _SOLAR_RE.match(first)
+        range_m = _SOLAR_RANGE_RE.match(first)
 
-        if time_m or solar_m:
+        if time_m or solar_m or range_m:
             job = _build_job_entry(parts, lineno, current_tz, current_lat, current_lon)
             job["filter"] = current_filter
             entries.append({"type": "tz_src_comment", "tokens": parts})
             entries.append(job)
         else:
+            if any(first.startswith(ev) for ev in _ALL_SOLAR_EVENTS):
+                print(f"WARNING line {lineno}: first field looks like a solar event "
+                      f"but is not a recognized expression — "
+                      f"solar events accept only [+-]<minutes> offsets and ~<jitter> "
+                      f"(e.g. 'sunrise+30', 'civil_dawn~5', 'solarnoon'): "
+                      f"{stripped!r}", file=sys.stderr)
+            elif not _is_valid_crontab_line(parts):
+                print(f"WARNING line {lineno}: unrecognized syntax "
+                      f"(not a .crontab_src time/solar spec, not a valid crontab line): "
+                      f"{stripped!r}", file=sys.stderr)
             entries.append({"type": "raw", "line": line})
 
     return entries
@@ -660,6 +736,33 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
         if jitter:
             dt_utc += timedelta(minutes=random.randint(0, jitter))
         local_times = [dt_utc.astimezone(system_tz)]
+    elif intended == "solar_range":
+        lat = entry.get("lat")
+        lon = entry.get("lon")
+        if lat is None or lon is None:
+            raise ValueError(f"solar range needs lat/lon: {entry['command']!r}")
+        dt1 = (_solar_event_utc(today, lat, lon, entry["range_event1"])
+               + timedelta(minutes=entry.get("range_offset1", 0)))
+        dt2 = (_solar_event_utc(today, lat, lon, entry["range_event2"])
+               + timedelta(minutes=entry.get("range_offset2", 0)))
+        if dt2 <= dt1:
+            # event2 precedes event1 today — try tomorrow's event2.
+            # Handles overnight ranges like sunset-sunrise where sunrise is next morning.
+            dt2 = (_solar_event_utc(today + timedelta(days=1), lat, lon,
+                                    entry["range_event2"])
+                   + timedelta(minutes=entry.get("range_offset2", 0)))
+        if dt2 <= dt1:
+            raise ValueError(
+                f"solar range: {entry['range_event2']} is not after "
+                f"{entry['range_event1']} on {today} "
+                f"(got {dt1.strftime('%H:%M')}–{dt2.strftime('%H:%M')} UTC)")
+        step = timedelta(minutes=entry["range_step_min"])
+        local_times = []
+        t = dt1
+        while t <= dt2:
+            jitter_td = timedelta(minutes=random.randint(0, jitter)) if jitter else timedelta(0)
+            local_times.append((t + jitter_td).astimezone(system_tz))
+            t += step
     else:
         hh_expr, mm_expr = intended.split(":", 1)
         try:
@@ -675,6 +778,110 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
                 if jitter:
                     dt_local += timedelta(minutes=random.randint(0, jitter))
                 local_times.append(dt_local)
+
+    # Collapse solar-range output to fewer cron lines where possible.
+    if intended == "solar_range" and not jitter and len(local_times) >= 2:
+        step_min = entry["range_step_min"]
+
+        if step_min % 60 == 0:
+            # Whole-hour step: every firing shares the same minute; each calendar
+            # day's hours form an arithmetic sequence → one range line per day.
+            # E.g., /1h across midnight → "41 20-23 * * * cmd" + "41 0-10 * * * cmd".
+            step_h = step_min // 60
+            if len({t.minute for t in local_times}) == 1:
+                mm = local_times[0].minute
+                day_groups: dict[int, list[int]] = {}
+                for t in local_times:
+                    delta = (t.date() - today).days
+                    day_groups.setdefault(delta, []).append(t.hour)
+                ok = True
+                # (hr_expr, cdays, command, prefix_comments)
+                group_results: list[tuple[str, str, str, list[str]]] = []
+                for delta in sorted(day_groups):
+                    hours = day_groups[delta]
+                    if hours != list(range(hours[0],
+                                          hours[0] + len(hours) * step_h, step_h)):
+                        ok = False
+                        break
+                    h1, h_last = hours[0], hours[-1]
+                    hr_expr = (f"{h1}-{h_last}" if step_h == 1
+                               else f"{h1}-{h_last}/{step_h}")
+                    days = days_base
+                    extra: list[str] = []
+                    if delta != 0:
+                        dom, month, dow = days.split()
+                        new_dow, shift_ok = _shift_dow(dow, delta)
+                        if shift_ok and new_dow != dow:
+                            extra.append(
+                                f"# dow shifted {delta:+d} (solar_range crosses midnight)"
+                            )
+                            days = f"{dom} {month} {new_dow}"
+                        elif not shift_ok:
+                            extra.append(
+                                f"# WARNING: solar_range crosses midnight; "
+                                f"dow field '{days.split()[2]}' may need manual adjustment"
+                            )
+                    dom, month, dow = days.split()
+                    dom, month, dow, command, dow_locked, dom_warnings = _expand_dom_spec(
+                        dom, month, dow, entry["command"]
+                    )
+                    cdays = f"{dom} {month} {dow}"
+                    cdays, command, filter_warnings = _apply_day_filter(
+                        cdays, filter_val, command, dow_locked=dow_locked
+                    )
+                    group_results.append(
+                        (hr_expr, cdays, command,
+                         extra + dom_warnings + filter_warnings)
+                    )
+                if ok:
+                    # If all groups share the same days+command (no effective dow
+                    # shift), merge into one line: "41 20-23,0-10 * * * cmd"
+                    if (len(group_results) > 1
+                            and len({(c, cmd)
+                                     for _, c, cmd, _ in group_results}) == 1):
+                        _, cdays, command, _ = group_results[0]
+                        all_comments = [ln for _, _, _, pfx in group_results
+                                        for ln in pfx]
+                        hr_list = ",".join(hr for hr, _, _, _ in group_results)
+                        return all_comments + [f"{mm} {hr_list} {cdays} {command}"]
+                    collapsed: list[str] = []
+                    for hr_expr, cdays, command, pfx in group_results:
+                        collapsed.extend(pfx + [f"{mm} {hr_expr} {cdays} {command}"])
+                    return collapsed
+
+        elif step_min < 60 and 60 % step_min == 0 \
+                and all(t.date() == today for t in local_times):
+            # Sub-hour step dividing 60: interior hours share the same minute pattern.
+            # E.g., /30m with sunrise at 5:47 → "17,47 6-19 * * * cmd" plus
+            # partial-hour lines for the boundary hours (5:47 and 20:17).
+            m0 = local_times[0].minute
+            cycle = sorted({(m0 + k * step_min) % 60 for k in range(60 // step_min)})
+            full_set = frozenset(cycle)
+            hour_minutes: dict[int, list[int]] = {}
+            for t in local_times:
+                hour_minutes.setdefault(t.hour, []).append(t.minute)
+            hours_sorted = sorted(hour_minutes)
+            interior = [h for h in hours_sorted if frozenset(hour_minutes[h]) == full_set]
+            if interior and interior == list(range(interior[0], interior[-1] + 1)):
+                dom, month, dow = days_base.split()
+                dom, month, dow, command, dow_locked, dom_warnings = _expand_dom_spec(
+                    dom, month, dow, entry["command"]
+                )
+                cdays = f"{dom} {month} {dow}"
+                cdays, command, filter_warnings = _apply_day_filter(
+                    cdays, filter_val, command, dow_locked=dow_locked
+                )
+                def _rline(mins: list[int], h_expr: str) -> str:
+                    return (f"{','.join(str(m) for m in sorted(mins))}"
+                            f" {h_expr} {cdays} {command}")
+                result = dom_warnings + filter_warnings
+                for h in [h for h in hours_sorted if h < interior[0]]:
+                    result.append(_rline(hour_minutes[h], str(h)))
+                h1, h_last = interior[0], interior[-1]
+                result.append(_rline(cycle, f"{h1}-{h_last}" if h1 != h_last else str(h1)))
+                for h in [h for h in hours_sorted if h > interior[-1]]:
+                    result.append(_rline(hour_minutes[h], str(h)))
+                return result
 
     result_lines: list[str] = []
     for dt_local in local_times:
