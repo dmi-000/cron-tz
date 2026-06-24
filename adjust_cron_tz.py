@@ -51,6 +51,34 @@ extensions that standard crontab does not support:
   first through fourth use the dom-range trick (no shell guard needed).
   last, -1, -2, … wrap the command in a python3 guard.
 
+Interval-firing jobs:
+
+  HH:MM/Nm              → fire every N minutes, starting from HH:MM today
+  HH:MM/Nm~J            → same, with up to J minutes of random jitter per firing
+  HH:MM/Nd              → fire at HH:MM every N days (one firing per matching day)
+  HH:MM/Nd~J            → same, with up to J minutes of jitter
+
+  Examples:
+    02:00/890m~5            * * *  python3 ~/e/src/fetch_enphase_forecast.py
+    2026-06-24T02:00/890m~5 * * *  python3 ~/e/src/fetch_enphase_forecast.py
+    06:00/5d                * * *  python3 ~/bin/weekly_report.py
+
+  /Nm: at compile time the script walks forward from the epoch in N-minute
+  steps and emits one cron line per firing that falls within the calendar day.
+  The epoch is the date-prefixed form if present (YYYY-MM-DDTHH:MM), else the
+  active # epoch: directive, else HH:MM today.  With a fixed epoch the firing
+  times drift by (N mod 1440) minutes per day across recompiles — useful for
+  irrational-interval sampling (890 min ≈ 1/φ days).  Without a fixed epoch
+  the times are identical on every recompile.
+
+  /Nd: equivalent to a fixed-time job with an every_n_days filter.  The
+  reference date for the cycle comes from the date-prefixed form, the # epoch:
+  directive, or today (fires on day 0, N, 2N, … from that date).
+
+  For /Nm, the dom/month/dow fields are passed through unchanged and the
+  active # filter: directive is applied on top.  For /Nd, the every_n_days
+  cycle replaces the active # filter: — combine manually if both are needed.
+
 Solar events (all require # lat/lon directives):
 
   sunrise            → standard sunrise (sun at geometric horizon)
@@ -105,7 +133,7 @@ Three directive types extend plain crontab:
      nth_weekday:N,DOW                    Nth weekday of month (e.g. 2,Mon)
      every_n_days:N,YYYY-MM-DD           every N days from reference date
      between:YYYY-MM-DD,YYYY-MM-DD       date-range gate
-     none                                 clear filter (runs every day)
+     none  (or: off)                      clear filter (runs every day)
 
    workday/weekend modify the crontab dow field directly.  The others wrap
    the command in a python3 one-liner guard (requires python3 in PATH at
@@ -120,11 +148,18 @@ Three directive types extend plain crontab:
 
 Jitter
 ------
-Appending ~N to any time spec adds a random delay of 0–N minutes at
-compile time.  Useful for avoiding thundering-herd when multiple machines
-run the same job.  A new random offset is chosen on each recompile.
+Appending ~N to a time spec adds a random delay of 0–N minutes at
+compile time.  A new random offset is chosen on each recompile.
 
      08:00~10  * * * python3 ~/bin/job.py   # fires 08:00–08:10
+
+For solar range specs, ~N can appear on an endpoint (jitters the range
+boundary once, then all firings march uniformly) or at the end of the
+whole spec (jitters each firing independently), or both:
+
+     sunrise-30~60-sunset+75/1h    # start shifts by 0–60 min; step uniform
+     sunrise-30-sunset+75/1h~60    # start fixed; each firing shifts 0–60 min
+     sunrise-30~60-sunset+75/1h~5  # both: boundary jitter + per-firing jitter
 
 Day-of-week adjustment
 ----------------------
@@ -174,6 +209,7 @@ Example ~/.crontab_src
 import argparse
 import fcntl
 import math
+import os
 import random
 import re
 import subprocess
@@ -215,12 +251,14 @@ _SOLAR_RE = re.compile(
     r"^(" + "|".join(_SOLAR_EVENT_NAMES) + r")([+-]\d+)?(?:~(\d+))?$"
 )
 
-# Solar range: event1[±off]-event2[±off]/N(m|h)[~jitter]
+# Solar range: event1[±off][~jitter1]-event2[±off][~jitter2]/N(m|h)[~jitter]
 # Step must carry a unit (m=minutes, h=hours) to avoid ambiguity with crontab step syntax.
-# Examples: civil_dawn-civil_dusk/1h  sunrise-sunset/30m  sunrise+30-sunset-30/2h~5
+# ~J on an endpoint jitters the range boundary once at compile time.
+# ~J at the end jitters each individual firing independently.
+# Examples: civil_dawn-civil_dusk/1h  sunrise-30~60-sunset+75/1h  sunrise-sunset/30m~5
 _SOLAR_RANGE_RE = re.compile(
-    r"^(" + "|".join(_SOLAR_EVENT_NAMES) + r")([+-]\d+)?"
-    r"-(" + "|".join(_SOLAR_EVENT_NAMES) + r")([+-]\d+)?"
+    r"^(" + "|".join(_SOLAR_EVENT_NAMES) + r")([+-]\d+)?(?:~(\d+))?"
+    r"-(" + "|".join(_SOLAR_EVENT_NAMES) + r")([+-]\d+)?(?:~(\d+))?"
     r"/(\d+)(m|h)"
     r"(?:~(\d+))?$"
 )
@@ -230,7 +268,17 @@ _TZ_RE     = re.compile(r"\btz\s*:\s*(\S+)")
 _LAT_RE    = re.compile(r"\blat\s*:\s*(-?\d+(?:\.\d*)?)")
 _LON_RE    = re.compile(r"\blon\s*:\s*(-?\d+(?:\.\d*)?)")
 _FILTER_RE = re.compile(r"\bfilter\s*:\s*(\S+)")
+_EPOCH_RE  = re.compile(r"\bepoch\s*:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})")
 _TZ_SRC_RE = re.compile(r"^#\s*\[tz-src\]\s+(.+)$")
+
+# [YYYY-MM-DDT]HH:MM/Nm[~jitter] and .../Nd[~jitter] — interval time specs.
+# The optional date prefix embeds the epoch inline; without it the epoch is
+# HH:MM today (same times each day) or the active # epoch: directive.
+# The unit suffix (m/d) distinguishes from the crontab step syntax that
+# _TIME_RE handles (e.g. '9-17:00/2' is a valid crontab step expression).
+_TIME_INTERVAL_RE = re.compile(
+    r"^(?:(\d{4}-\d{2}-\d{2})T)?(\d{1,2}):(\d{2})/(\d+)(m|d)(?:~(\d+))?$"
+)
 
 # Heuristic to catch '# filter keyword' with a missing colon
 _FILTER_TYPO_RE = re.compile(
@@ -283,10 +331,6 @@ _ORDINAL_NAMES = {
     "fifth":  5, "5th": 5,
     "last":   0, "-1st": 0, "-1th": 0,
 }
-
-# Filters that override the crontab dow field (conflict with ordinal-weekday dom)
-_DOW_FILTERS = {"workday", "weekend"}
-
 
 # ── Solar geometry ─────────────────────────────────────────────────────────────
 
@@ -359,17 +403,7 @@ def _expand_cron_field(expr: str, lo: int, hi: int) -> list[int]:
 # ── System timezone ────────────────────────────────────────────────────────────
 
 def _system_tz() -> ZoneInfo:
-    # macOS
-    try:
-        out = subprocess.check_output(
-            ["systemsetup", "-gettimezone"], stderr=subprocess.DEVNULL
-        ).decode()
-        name = out.split("Time Zone:")[-1].strip()
-        if name:
-            return ZoneInfo(name)
-    except Exception:
-        pass
-    # Linux / other: resolve /etc/localtime symlink
+    # Resolve /etc/localtime symlink — works on macOS and Linux, no privileges needed.
     try:
         lt = str(Path("/etc/localtime").resolve())
         for marker in ["/zoneinfo/", "\\zoneinfo\\"]:
@@ -377,6 +411,13 @@ def _system_tz() -> ZoneInfo:
                 return ZoneInfo(lt.split(marker, 1)[1])
     except Exception:
         pass
+    # Fall back to the TZ environment variable
+    tz_env = os.environ.get("TZ", "")
+    if tz_env:
+        try:
+            return ZoneInfo(tz_env)
+        except Exception:
+            pass
     return ZoneInfo("UTC")
 
 
@@ -401,9 +442,6 @@ def _shift_dow(dow: str, delta: int) -> tuple[str, bool]:
             return dow, False          # step expression — too complex
         if "," in dow:
             return ",".join(shift_token(p) for p in dow.split(",")), True
-        if re.search(r"[A-Za-z]", dow) and "-" in dow:
-            a, b = dow.split("-", 1)
-            return f"{shift_token(a)}-{shift_token(b)}", True
         if "-" in dow:
             a, b = dow.split("-", 1)
             return f"{shift_token(a)}-{shift_token(b)}", True
@@ -616,16 +654,18 @@ def _build_job_entry(parts: list[str], lineno: int,
         entry["lat"] = current_lat
         entry["lon"] = current_lon
     elif range_m:
-        unit = range_m.group(6)
-        step_min = int(range_m.group(5)) * (60 if unit == "h" else 1)
-        entry["intended"]       = "solar_range"
-        entry["range_event1"]   = range_m.group(1)
-        entry["range_offset1"]  = int(range_m.group(2)) if range_m.group(2) else 0
-        entry["range_event2"]   = range_m.group(3)
-        entry["range_offset2"]  = int(range_m.group(4)) if range_m.group(4) else 0
-        entry["range_step_min"] = step_min
-        if range_m.group(7):
-            entry["jitter_min"] = int(range_m.group(7))
+        unit = range_m.group(8)
+        step_min = int(range_m.group(7)) * (60 if unit == "h" else 1)
+        entry["intended"]        = "solar_range"
+        entry["range_event1"]    = range_m.group(1)
+        entry["range_offset1"]   = int(range_m.group(2)) if range_m.group(2) else 0
+        entry["range_jitter1"]   = int(range_m.group(3)) if range_m.group(3) else 0
+        entry["range_event2"]    = range_m.group(4)
+        entry["range_offset2"]   = int(range_m.group(5)) if range_m.group(5) else 0
+        entry["range_jitter2"]   = int(range_m.group(6)) if range_m.group(6) else 0
+        entry["range_step_min"]  = step_min
+        if range_m.group(9):
+            entry["jitter_min"] = int(range_m.group(9))
         entry["lat"] = current_lat
         entry["lon"] = current_lon
     return entry
@@ -637,6 +677,7 @@ def parse_source(text: str) -> list[dict]:
     current_lat    = None
     current_lon    = None
     current_filter = None
+    current_epoch: str | None = None
     skip_next_job  = False
     entries = []
 
@@ -651,7 +692,13 @@ def parse_source(text: str) -> list[dict]:
         if stripped.startswith("#"):
             m = _TZ_RE.search(stripped)
             if m:
-                current_tz = m.group(1)
+                candidate = m.group(1)
+                if candidate.lower() in ("none", "off", "clear"):
+                    print(f"WARNING line {lineno}: '# tz: {candidate}' is not a valid "
+                          f"timezone — to use the system timezone write '# tz: local'; "
+                          f"directive ignored", file=sys.stderr)
+                else:
+                    current_tz = candidate
             m = _LAT_RE.search(stripped)
             if m:
                 current_lat = float(m.group(1))
@@ -665,6 +712,9 @@ def parse_source(text: str) -> list[dict]:
             elif _FILTER_TYPO_RE.search(stripped):
                 print(f"WARNING line {lineno}: looks like a malformed filter directive "
                       f"(missing colon after 'filter'?): {stripped!r}", file=sys.stderr)
+            m = _EPOCH_RE.search(stripped)
+            if m:
+                current_epoch = m.group(1)
 
             m = _TZ_SRC_RE.match(stripped)
             if m:
@@ -687,17 +737,94 @@ def parse_source(text: str) -> list[dict]:
             skip_next_job = False
             continue
 
-        parts   = stripped.split()
-        first   = parts[0] if parts else ""
-        time_m  = _TIME_RE.match(first)
-        solar_m = _SOLAR_RE.match(first)
-        range_m = _SOLAR_RANGE_RE.match(first)
+        parts      = stripped.split()
+        first      = parts[0] if parts else ""
+        time_m     = _TIME_RE.match(first)
+        solar_m    = _SOLAR_RE.match(first)
+        range_m    = _SOLAR_RANGE_RE.match(first)
+        interval_m = _TIME_INTERVAL_RE.match(first)
 
         if time_m or solar_m or range_m:
             job = _build_job_entry(parts, lineno, current_tz, current_lat, current_lon)
             job["filter"] = current_filter
             entries.append({"type": "tz_src_comment", "tokens": parts})
             entries.append(job)
+        elif interval_m:
+            ok = True
+            if len(parts) < 5:
+                print(f"WARNING line {lineno}: interval job needs "
+                      f"'HH:MM/Nm dom month dow command', got {stripped!r}", file=sys.stderr)
+                ok = False
+            elif current_tz is None:
+                print(f"WARNING line {lineno}: no '# tz:' directive before interval job",
+                      file=sys.stderr)
+                ok = False
+            if ok:
+                try:
+                    tz_obj = (None if current_tz.lower() == "local"  # type: ignore[union-attr]
+                              else ZoneInfo(current_tz))              # type: ignore[arg-type]
+                except ZoneInfoNotFoundError:
+                    print(f"WARNING line {lineno}: unknown timezone {current_tz!r}",
+                          file=sys.stderr)
+                    ok = False
+            if ok:
+                inline_date = interval_m.group(1)       # YYYY-MM-DD or None
+                anchor_hh  = int(interval_m.group(2))
+                anchor_mm  = int(interval_m.group(3))
+                interval_n = int(interval_m.group(4))
+                unit       = interval_m.group(5)        # 'm' or 'd'
+                jitter     = int(interval_m.group(6)) if interval_m.group(6) else 0
+                eff_tz     = tz_obj or _system_tz()
+                if inline_date:
+                    try:
+                        date.fromisoformat(inline_date)
+                    except ValueError:
+                        print(f"WARNING line {lineno}: invalid date {inline_date!r} "
+                              f"in interval spec {first!r} — line skipped", file=sys.stderr)
+                        ok = False
+
+                if unit == 'm':
+                    # Epoch precedence: inline date > # epoch: > HH:MM today
+                    if inline_date:
+                        epoch_str = f"{inline_date}T{anchor_hh:02d}:{anchor_mm:02d}"
+                    elif current_epoch:
+                        epoch_str = current_epoch
+                    else:
+                        today_in_tz = datetime.now(tz=eff_tz).date()
+                        epoch_str = (f"{today_in_tz.isoformat()}"
+                                     f"T{anchor_hh:02d}:{anchor_mm:02d}")
+                    entries.append({
+                        "type":         "every_interval",
+                        "timezone":     current_tz,
+                        "tz_obj":       tz_obj,
+                        "interval_min": interval_n,
+                        "jitter_min":   jitter,
+                        "epoch":        epoch_str,
+                        "days":         " ".join(parts[1:4]),
+                        "command":      " ".join(parts[4:]),
+                        "filter":       current_filter,
+                        "src_tokens":   parts,
+                    })
+
+                else:  # unit == 'd': single daily firing with every_n_days filter
+                    if inline_date:
+                        ref_date = inline_date
+                    elif current_epoch:
+                        ref_date = current_epoch.split("T")[0]
+                    else:
+                        ref_date = datetime.now(tz=eff_tz).date().isoformat()
+                    anchor_spec = f"{anchor_hh:02d}:{anchor_mm:02d}"
+                    if jitter:
+                        anchor_spec += f"~{jitter}"
+                    job = _build_job_entry(
+                        [anchor_spec] + parts[1:], lineno,
+                        current_tz, current_lat, current_lon
+                    )
+                    job["filter"] = f"every_n_days:{interval_n},{ref_date}"
+                    entries.append({"type": "tz_src_comment", "tokens": parts})
+                    entries.append(job)
+            else:
+                entries.append({"type": "raw", "line": line})
         else:
             if any(first.startswith(ev) for ev in _ALL_SOLAR_EVENTS):
                 print(f"WARNING line {lineno}: first field looks like a solar event "
@@ -741,16 +868,24 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
         lon = entry.get("lon")
         if lat is None or lon is None:
             raise ValueError(f"solar range needs lat/lon: {entry['command']!r}")
+        rj1 = entry.get("range_jitter1", 0)
+        rj2 = entry.get("range_jitter2", 0)
+        rj1_td = timedelta(minutes=random.randint(0, rj1)) if rj1 else timedelta(0)
+        rj2_td = timedelta(minutes=random.randint(0, rj2)) if rj2 else timedelta(0)
         dt1 = (_solar_event_utc(today, lat, lon, entry["range_event1"])
-               + timedelta(minutes=entry.get("range_offset1", 0)))
+               + timedelta(minutes=entry.get("range_offset1", 0))
+               + rj1_td)
         dt2 = (_solar_event_utc(today, lat, lon, entry["range_event2"])
-               + timedelta(minutes=entry.get("range_offset2", 0)))
+               + timedelta(minutes=entry.get("range_offset2", 0))
+               + rj2_td)
         if dt2 <= dt1:
             # event2 precedes event1 today — try tomorrow's event2.
             # Handles overnight ranges like sunset-sunrise where sunrise is next morning.
+            # Reuse the same rj2_td so the endpoint jitter is consistent.
             dt2 = (_solar_event_utc(today + timedelta(days=1), lat, lon,
                                     entry["range_event2"])
-                   + timedelta(minutes=entry.get("range_offset2", 0)))
+                   + timedelta(minutes=entry.get("range_offset2", 0))
+                   + rj2_td)
         if dt2 <= dt1:
             raise ValueError(
                 f"solar range: {entry['range_event2']} is not after "
@@ -924,6 +1059,58 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
     return result_lines
 
 
+def _compile_every(entry: dict, system_tz: ZoneInfo) -> list[str]:
+    """Enumerate HH:MM/Nm firings within today in system_tz and emit cron lines."""
+    today_sys = datetime.now(tz=system_tz).date()
+    tz = entry["tz_obj"] or system_tz
+
+    epoch_naive = datetime.strptime(entry["epoch"], "%Y-%m-%dT%H:%M")
+    epoch_dt    = epoch_naive.replace(tzinfo=tz)
+
+    interval_min = entry["interval_min"]
+    jitter       = entry.get("jitter_min", 0)
+    filter_val   = entry.get("filter")
+
+    today_start = datetime(today_sys.year, today_sys.month, today_sys.day,
+                           tzinfo=system_tz)
+    today_end = today_start + timedelta(days=1)
+
+    # First k s.t. epoch + k*interval >= today_start
+    delta_s = (today_start - epoch_dt.astimezone(system_tz)).total_seconds()
+    k0 = max(0, math.ceil(delta_s / 60 / interval_min))
+
+    src_tokens = entry.get("src_tokens")
+    header = ("# [every] " + " ".join(src_tokens)) if src_tokens else f"# [every:{interval_min}m]"
+
+    # Dom expansion and filter application are the same for every firing — do once.
+    dom, month, dow = entry["days"].split()
+    dom, month, dow, command, dow_locked, dom_warnings = _expand_dom_spec(
+        dom, month, dow, entry["command"]
+    )
+    cdays = f"{dom} {month} {dow}"
+    cdays, command, filter_warnings = _apply_day_filter(
+        cdays, filter_val, command, dow_locked=dow_locked
+    )
+    preamble = dom_warnings + filter_warnings
+
+    firing_lines: list[str] = []
+    k = k0
+    while True:
+        t_sys = (epoch_dt + timedelta(minutes=k * interval_min)).astimezone(system_tz)
+        if t_sys >= today_end:
+            break
+        if t_sys >= today_start:
+            if jitter:
+                t_sys = t_sys + timedelta(minutes=random.randint(0, jitter))
+            firing_lines.append(f"{t_sys.minute} {t_sys.hour} {cdays} {command}")
+        k += 1
+
+    if not firing_lines:
+        return [header] + preamble + [f"# no firings today for {interval_min}m interval"]
+
+    return [header] + preamble + firing_lines
+
+
 def compile_crontab(entries: list[dict], system_tz: ZoneInfo,
                     src_path: Path) -> list[str]:
     now_str = datetime.now(tz=system_tz).strftime("%Y-%m-%d %H:%M")
@@ -940,6 +1127,8 @@ def compile_crontab(entries: list[dict], system_tz: ZoneInfo,
             lines.append(entry["line"])
         elif t == "job":
             lines.extend(_compile_job(entry, system_tz))
+        elif t == "every_interval":
+            lines.extend(_compile_every(entry, system_tz))
     return lines
 
 
