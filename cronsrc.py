@@ -212,8 +212,10 @@ import math
 import os
 import random
 import re
+import select
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1060,8 +1062,8 @@ def _compile_job(entry: dict, system_tz: ZoneInfo) -> list[str]:
 
 
 def _compile_every(entry: dict, system_tz: ZoneInfo) -> list[str]:
-    """Enumerate HH:MM/Nm firings within today in system_tz and emit cron lines."""
-    today_sys = datetime.now(tz=system_tz).date()
+    """Enumerate HH:MM/Nm firings in the next 24h from now and emit date-specific cron lines."""
+    now = datetime.now(tz=system_tz)
     tz = entry["tz_obj"] or system_tz
 
     epoch_naive = datetime.strptime(entry["epoch"], "%Y-%m-%dT%H:%M")
@@ -1071,12 +1073,10 @@ def _compile_every(entry: dict, system_tz: ZoneInfo) -> list[str]:
     jitter       = entry.get("jitter_min", 0)
     filter_val   = entry.get("filter")
 
-    today_start = datetime(today_sys.year, today_sys.month, today_sys.day,
-                           tzinfo=system_tz)
-    today_end = today_start + timedelta(days=1)
+    window_end = now + timedelta(days=1)
 
-    # First k s.t. epoch + k*interval >= today_start
-    delta_s = (today_start - epoch_dt.astimezone(system_tz)).total_seconds()
+    # First k s.t. epoch + k*interval >= now
+    delta_s = (now - epoch_dt.astimezone(system_tz)).total_seconds()
     k0 = max(0, math.ceil(delta_s / 60 / interval_min))
 
     src_tokens = entry.get("src_tokens")
@@ -1097,16 +1097,16 @@ def _compile_every(entry: dict, system_tz: ZoneInfo) -> list[str]:
     k = k0
     while True:
         t_sys = (epoch_dt + timedelta(minutes=k * interval_min)).astimezone(system_tz)
-        if t_sys >= today_end:
+        if t_sys >= window_end:
             break
-        if t_sys >= today_start:
+        if t_sys >= now:
             if jitter:
                 t_sys = t_sys + timedelta(minutes=random.randint(0, jitter))
             firing_lines.append(f"{t_sys.minute} {t_sys.hour} {cdays} {command}")
         k += 1
 
     if not firing_lines:
-        return [header] + preamble + [f"# no firings today for {interval_min}m interval"]
+        return [header] + preamble + [f"# no firings in next 24h for {interval_min}m interval"]
 
     return [header] + preamble + firing_lines
 
@@ -1134,6 +1134,65 @@ def compile_crontab(entries: list[dict], system_tz: ZoneInfo,
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+def _compile_once(src: Path, dry_run: bool = False) -> None:
+    system_tz = _system_tz()
+    src_text  = src.read_text()
+    entries   = parse_source(src_text)
+    lines     = compile_crontab(entries, system_tz, src.resolve())
+    crontab   = "\n".join(lines) + "\n"
+
+    ts = datetime.now(tz=system_tz).strftime("%H:%M:%S")
+    print(f"[{ts}] System timezone: {system_tz.key}")
+    print("Generated crontab:")
+    print("─" * 60)
+    print(crontab, end="")
+    print("─" * 60)
+
+    if dry_run:
+        print("(dry run — not installed)")
+        return
+
+    pending = Path.home() / ".local/share/adjust_cron_tz/pending.crontab"
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.write_text(crontab)
+    subprocess.run(["/usr/bin/crontab", str(pending)], check=True)
+    print("Installed.")
+
+
+def _watch_src(src: Path, deadline: datetime) -> str:
+    """Block until src is written/renamed or deadline passes.
+    Returns 'changed' or 'deadline'. Caps each wait at 1800s so a long system
+    sleep never causes us to miss the deadline by more than one chunk."""
+    kq = select.kqueue()
+    with open(src) as fh:
+        ev = select.kevent(
+            fh.fileno(),
+            filter=select.KQ_FILTER_VNODE,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+            fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_ATTRIB
+                   | select.KQ_NOTE_RENAME | select.KQ_NOTE_DELETE,
+        )
+        kq.control([ev], 0)
+        while True:
+            remaining = (deadline - datetime.now()).total_seconds()
+            if remaining <= 0:
+                return 'deadline'
+            if kq.control(None, 4, min(1800.0, remaining)):
+                return 'changed'
+
+
+def _run_loop(src: Path) -> None:
+    """Compile+install, then watch src for changes and recompile when it fires
+    or when the 24h window is about to expire."""
+    while True:
+        _compile_once(src)
+        deadline = datetime.now() + timedelta(hours=24) - timedelta(minutes=5)
+        reason = _watch_src(src, deadline)
+        ts = datetime.now().strftime("%H:%M:%S")
+        label = f"{src.name} changed" if reason == 'changed' else "24h window expiring"
+        print(f"[{ts}] {label}; recompiling.", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1141,12 +1200,29 @@ def main():
                     help="Source file (default: ~/.crontab_src)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print generated crontab without installing it")
+    ap.add_argument("--loop", action="store_true",
+                    help="Compile then loop, sleeping until next recompile window")
+    ap.add_argument("--daemon", action="store_true",
+                    help="Fork+setsid then run --loop (writes PID to loop.pid)")
     args = ap.parse_args()
 
     if not args.src.exists():
         print(f"Source file not found: {args.src}", file=sys.stderr)
         print("Create it — see the docstring in this script for an example.", file=sys.stderr)
         sys.exit(1)
+
+    if args.daemon:
+        pid = os.fork()
+        if pid != 0:
+            return  # parent exits; child continues below
+        os.setsid()
+        # Inherited fds point to the log file; switch to line-buffering so
+        # each print() reaches disk without waiting for the buffer to fill.
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+        pid_path = Path.home() / ".local/share/adjust_cron_tz/loop.pid"
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(os.getpid()))
 
     lock_path = Path(f"/tmp/adjust_cron_tz_{Path.home().name}.lock")
     lock_fh   = open(lock_path, "w")
@@ -1157,24 +1233,10 @@ def main():
         sys.exit(0)
 
     try:
-        system_tz = _system_tz()
-        src_text  = args.src.read_text()
-        entries   = parse_source(src_text)
-        lines     = compile_crontab(entries, system_tz, args.src.resolve())
-        crontab   = "\n".join(lines) + "\n"
-
-        print(f"System timezone: {system_tz.key}")
-        print("Generated crontab:")
-        print("─" * 60)
-        print(crontab, end="")
-        print("─" * 60)
-
-        if args.dry_run:
-            print("(dry run — not installed)")
-            return
-
-        subprocess.run(["crontab", "-"], input=crontab.encode(), check=True)
-        print("Installed.")
+        if args.loop or args.daemon:
+            _run_loop(args.src)
+        else:
+            _compile_once(args.src, dry_run=args.dry_run)
     finally:
         fcntl.flock(lock_fh, fcntl.LOCK_UN)
         lock_fh.close()
