@@ -11,7 +11,7 @@ recompiles immediately on changes, keeping cron's schedule current without polli
 
 | Feature | Example |
 |---|---|
-| Timezone-aware fixed times | `08:00~10  * * *  cmd` (fires at 08:00 local regardless of system TZ) |
+| Timezone-aware fixed times | `08:00~10  * * *  cmd` (fires at 08:00 in the named TZ even when the system TZ differs) |
 | Solar events | `sunrise * * *  cmd`, `sunset+30 * * *  cmd` |
 | Solar ranges | `sunrise-30-sunset+75/1h  * * *  cmd` |
 | Irrational-interval sampling | `2026-01-01T00:00/551m  * * *  cmd` |
@@ -88,7 +88,7 @@ Required for solar events.
 08:00        * * *  python3 ~/bin/morning.py
 08:00~15     * * *  python3 ~/bin/morning.py   # jitter 0–15 min
 9,17:00      * * *  python3 ~/bin/twice.py     # 09:00 and 17:00
-9-17/2:00    * * *  python3 ~/bin/biennial.py  # every 2h, 09:00–17:00
+9-17/2:00    * * *  python3 ~/bin/every2h.py  # every 2h, 09:00–17:00
 ```
 
 When the system timezone differs from `# tz:`, times are converted automatically.
@@ -140,8 +140,9 @@ At each compile the script walks forward from the epoch in N-minute steps and em
 one cron line per firing that falls in the next 24 hours. With a fixed epoch, firing
 times drift by `N mod 1440` minutes per day across recompiles.
 
-551 minutes (≈ 1440 / φ²) gives near-uniform daily coverage over a few days,
-useful for spreading API polls without a predictable pattern.
+551 minutes (≈ 1440 / φ²) is coprime to 1440, so the firing phase precesses through
+the day by a fixed amount on each recompile, covering different hours across multiple
+days deterministically. Unlike jitter, the times are reproducible from the epoch.
 
 ### Day filters
 
