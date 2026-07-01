@@ -22,7 +22,7 @@ recompiles immediately on changes, keeping cron's schedule current without polli
 ## Installation
 
 ```bash
-cp cronsrc.py ~/.local/bin/crontabctl
+cp crontabctl.py ~/.local/bin/crontabctl
 chmod +x ~/.local/bin/crontabctl
 ```
 
