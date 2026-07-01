@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-adjust_cron_tz.py — Crontab compiler with timezone and solar time support.
+crontabctl — Crontab compiler with timezone and solar time support.
 
-Source of truth: ~/.crontab_src  (edit this, not crontab directly)
+Source of truth: ~/.crontab.in  (edit this, not crontab directly)
 Output: overwrites crontab via `crontab -`
 
 Run on wake, on network change, or daily to keep cron times current when
@@ -184,13 +184,13 @@ the job source and the compiled line immediately following is skipped and
 replaced.  Raw lines added directly to the crontab have no preceding
 [tz-src] comment and pass through untouched.
 
-Example ~/.crontab_src
-----------------------
+Example ~/.crontab.in
+---------------------
   SHELL=/bin/bash
   PATH=/usr/local/bin:/usr/bin:/bin
 
   # recompile daily at 03:00 UTC to update solar times
-  0 3 * * * python3 ~/bin/adjust_cron_tz.py
+  0 3 * * * crontabctl
 
   # tz: Europe/London
   # lat: 51.50  lon: -0.12
@@ -215,12 +215,13 @@ import re
 import select
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-META = Path("~/.crontab_src").expanduser()
+META = Path("~/.crontab.in").expanduser()
 
 # First-field pattern for tz-aware fixed-time jobs.
 # HH and MM may be crontab field expressions (digits, *, , - /).
@@ -674,7 +675,7 @@ def _build_job_entry(parts: list[str], lineno: int,
 
 
 def parse_source(text: str) -> list[dict]:
-    """Parse a crontab_src file into a list of entry dicts."""
+    """Parse a crontab.in file into a list of entry dicts."""
     current_tz     = None
     current_lat    = None
     current_lon    = None
@@ -836,7 +837,7 @@ def parse_source(text: str) -> list[dict]:
                       f"{stripped!r}", file=sys.stderr)
             elif not _is_valid_crontab_line(parts):
                 print(f"WARNING line {lineno}: unrecognized syntax "
-                      f"(not a .crontab_src time/solar spec, not a valid crontab line): "
+                      f"(not a .crontab.in time/solar spec, not a valid crontab line): "
                       f"{stripped!r}", file=sys.stderr)
             entries.append({"type": "raw", "line": line})
 
@@ -1132,6 +1133,177 @@ def compile_crontab(entries: list[dict], system_tz: ZoneInfo,
     return lines
 
 
+# ── Reset epoch ────────────────────────────────────────────────────────────────
+
+def _reset_epoch(src: Path, dry_run: bool = False) -> bool:
+    """Rewrite each inline-date /Nm interval epoch to the last firing time.
+    Returns True if any line was changed."""
+    text  = src.read_text()
+    lines = text.splitlines(keepends=True)
+
+    current_tz: str | None = None
+    out_lines: list[str]   = []
+    changed = 0
+
+    for raw_line in lines:
+        line     = raw_line.rstrip("\r\n")
+        stripped = line.strip()
+
+        # Track # tz: directive exactly as parse_source does
+        if stripped.startswith("#"):
+            m = _TZ_RE.search(stripped)
+            if m:
+                candidate = m.group(1)
+                if candidate.lower() not in ("none", "off", "clear"):
+                    current_tz = candidate
+            out_lines.append(raw_line)
+            continue
+
+        if not stripped:
+            out_lines.append(raw_line)
+            continue
+
+        parts = stripped.split()
+        first = parts[0]
+        m     = _TIME_INTERVAL_RE.match(first)
+
+        # Only act on /Nm lines that already carry an inline date
+        if not (m and m.group(1) and m.group(5) == "m"):
+            out_lines.append(raw_line)
+            continue
+
+        inline_date = m.group(1)
+        anchor_hh   = int(m.group(2))
+        anchor_mm   = int(m.group(3))
+        interval_n  = int(m.group(4))
+        jitter_sfx  = f"~{m.group(6)}" if m.group(6) else ""
+
+        if current_tz and current_tz.lower() != "local":
+            try:
+                tz = ZoneInfo(current_tz)
+            except ZoneInfoNotFoundError:
+                out_lines.append(raw_line)
+                continue
+        else:
+            tz = _system_tz()
+
+        epoch_dt = datetime(
+            int(inline_date[:4]), int(inline_date[5:7]), int(inline_date[8:]),
+            anchor_hh, anchor_mm, tzinfo=tz,
+        )
+        now      = datetime.now(tz=tz)
+        delta_s  = (now - epoch_dt).total_seconds()
+        if delta_s < 0:
+            print(f"  {first}: epoch is in the future — skipped")
+            out_lines.append(raw_line)
+            continue
+
+        k          = int(delta_s / 60 / interval_n)
+        last_fired = epoch_dt + timedelta(minutes=k * interval_n)
+        new_first  = (f"{last_fired.strftime('%Y-%m-%dT%H:%M')}"
+                      f"/{interval_n}m{jitter_sfx}")
+
+        if new_first == first:
+            out_lines.append(raw_line)
+            continue
+
+        print(f"  {first}  →  {new_first}")
+        out_lines.append(raw_line.replace(first, new_first, 1))
+        changed += 1
+
+    if changed == 0:
+        print("No interval epochs to update.")
+        return False
+
+    new_text = "".join(out_lines)
+    if dry_run:
+        print(f"\n--- dry run: {changed} epoch(s) would change ---")
+        print(new_text, end="")
+        return False
+
+    fd, tmp = tempfile.mkstemp(dir=src.parent, prefix=".crontab.in.epoch.")
+    committed = False
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(new_text)
+        os.rename(tmp, src)
+        committed = True
+    finally:
+        if not committed:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+    print(f"{changed} epoch(s) updated in {src}")
+    return True
+
+
+# ── Edit ───────────────────────────────────────────────────────────────────────
+
+def _edit_src(src: Path) -> bool:
+    """Open src in $VISUAL/$EDITOR via a same-dir temp file, then atomically
+    rename into place on save.  Returns True if the file was changed."""
+    import io, contextlib, shlex
+    editor_cmd = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+
+    src_text = src.read_text() if src.exists() else ""
+    fd, tmp_path = tempfile.mkstemp(dir=src.parent, prefix=".crontab.in.tmp.",
+                                    suffix=".crontab.in")
+    committed = False
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(src_text)
+
+        while True:
+            mtime_before = os.path.getmtime(tmp_path)
+            subprocess.run(editor_cmd + [tmp_path])
+            mtime_after = os.path.getmtime(tmp_path)
+
+            if mtime_after == mtime_before:
+                print("No changes.")
+                return False
+
+            new_text = Path(tmp_path).read_text()
+
+            # Capture warnings emitted by parse_source to stderr
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                parse_source(new_text)
+            warnings = buf.getvalue()
+
+            if not warnings:
+                break   # clean parse — proceed to commit
+
+            # Show warnings and let the user decide
+            print(warnings, end="", file=sys.stderr)
+            try:
+                ans = input("File has warnings. Re-edit? [Y/n] ").strip().lower()
+            except EOFError:
+                ans = "n"
+            if ans in ("n", "no"):
+                try:
+                    ans2 = input("Save anyway? [y/N] ").strip().lower()
+                except EOFError:
+                    ans2 = "n"
+                if ans2 not in ("y", "yes"):
+                    print("Changes not saved.")
+                    return False
+                break   # user chose to save despite warnings
+            # else: re-open the editor
+
+        os.rename(tmp_path, src)   # atomic on same filesystem
+        committed = True
+        print(f"Saved {src}")
+        return True
+    finally:
+        if not committed:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def _compile_once(src: Path, dry_run: bool = False) -> None:
@@ -1152,7 +1324,7 @@ def _compile_once(src: Path, dry_run: bool = False) -> None:
         print("(dry run — not installed)")
         return
 
-    pending = Path.home() / ".local/share/adjust_cron_tz/pending.crontab"
+    pending = Path.home() / ".local/share/crontabctl/pending.crontab"
     pending.parent.mkdir(parents=True, exist_ok=True)
     pending.write_text(crontab)
     subprocess.run(["/usr/bin/crontab", str(pending)], check=True)
@@ -1163,6 +1335,10 @@ def _watch_src(src: Path, deadline: datetime) -> str:
     """Block until src is written/renamed or deadline passes.
     Returns 'changed' or 'deadline'. Caps each wait at 1800s so a long system
     sleep never causes us to miss the deadline by more than one chunk."""
+    if not src.exists():
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Source file gone: {src} — exiting loop.",
+              flush=True)
+        return 'changed'   # triggers _compile_once which exits cleanly with "not found"
     kq = select.kqueue()
     with open(src) as fh:
         ev = select.kevent(
@@ -1197,16 +1373,28 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", type=Path, default=META,
-                    help="Source file (default: ~/.crontab_src)")
+                    help="Source file (default: ~/.crontab.in)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="Print generated crontab without installing it")
-    ap.add_argument("--loop", action="store_true",
-                    help="Compile then loop, sleeping until next recompile window")
-    ap.add_argument("--daemon", action="store_true",
-                    help="Fork+setsid then run --loop (writes PID to loop.pid)")
+                    help="For compile: print generated crontab without installing. "
+                         "For --edit: save source but skip install. "
+                         "For --reset-epoch: show what would change without writing.")
+
+    modes = ap.add_mutually_exclusive_group()
+    modes.add_argument("-e", "--edit", action="store_true",
+                       help="Open source in $VISUAL/$EDITOR (atomic write), then recompile")
+    modes.add_argument("--reset-epoch", action="store_true",
+                       help="Rewrite each /Nm inline-date epoch to the last actual firing, "
+                            "then recompile")
+    modes.add_argument("--loop", action="store_true",
+                       help="Compile then loop, recompiling on file change or 24h window")
+    modes.add_argument("--daemon", action="store_true",
+                       help="Fork+setsid then run --loop (writes PID to loop.pid)")
     args = ap.parse_args()
 
-    if not args.src.exists():
+    if (args.loop or args.daemon) and args.dry_run:
+        print("Warning: --dry-run has no effect with --loop/--daemon", file=sys.stderr)
+
+    if not args.src.exists() and not args.edit:
         print(f"Source file not found: {args.src}", file=sys.stderr)
         print("Create it — see the docstring in this script for an example.", file=sys.stderr)
         sys.exit(1)
@@ -1220,26 +1408,68 @@ def main():
         # each print() reaches disk without waiting for the buffer to fill.
         sys.stdout.reconfigure(line_buffering=True)
         sys.stderr.reconfigure(line_buffering=True)
-        pid_path = Path.home() / ".local/share/adjust_cron_tz/loop.pid"
+        pid_path = Path.home() / ".local/share/crontabctl/loop.pid"
         pid_path.parent.mkdir(parents=True, exist_ok=True)
         pid_path.write_text(str(os.getpid()))
 
-    lock_path = Path(f"/tmp/adjust_cron_tz_{Path.home().name}.lock")
+    lock_path = Path(f"/tmp/crontabctl_{Path.home().name}.lock")
     lock_fh   = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print("Another instance is running; exiting.", file=sys.stderr)
-        sys.exit(0)
 
-    try:
-        if args.loop or args.daemon:
-            _run_loop(args.src)
-        else:
-            _compile_once(args.src, dry_run=args.dry_run)
-    finally:
+    def _acquire(blocking: bool = False) -> bool:
+        flag = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(lock_fh, flag)
+            return True
+        except BlockingIOError:
+            return False
+
+    def _release() -> None:
         fcntl.flock(lock_fh, fcntl.LOCK_UN)
         lock_fh.close()
+
+    if args.loop or args.daemon:
+        # Long-running: must be the only instance.
+        if not _acquire():
+            print("Another instance is running; exiting.", file=sys.stderr)
+            sys.exit(0)
+        try:
+            _run_loop(args.src)
+        finally:
+            _release()
+
+    elif args.edit or args.reset_epoch:
+        # File-write phase needs no lock — atomic rename is its own synchronisation,
+        # and the daemon's kqueue watcher fires on KQ_NOTE_RENAME to recompile.
+        if args.edit:
+            changed = _edit_src(args.src)
+        else:
+            _reset_epoch(args.src, dry_run=args.dry_run)
+            # Always compile after --reset-epoch: solar times need updating even
+            # when no /Nm epoch moved (e.g. all intervals divide 1440).
+            changed = not args.dry_run
+
+        # Compile phase.  If the daemon is running it will recompile; otherwise
+        # we do it ourselves.
+        if changed:
+            if _acquire():
+                try:
+                    _compile_once(args.src, dry_run=args.dry_run)
+                finally:
+                    _release()
+            else:
+                print("Daemon is running — it will recompile automatically.")
+                lock_fh.close()
+        else:
+            lock_fh.close()
+
+    else:
+        if not _acquire():
+            print("Another instance is running; exiting.", file=sys.stderr)
+            sys.exit(0)
+        try:
+            _compile_once(args.src, dry_run=args.dry_run)
+        finally:
+            _release()
 
 
 if __name__ == "__main__":

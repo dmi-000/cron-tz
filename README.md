@@ -1,9 +1,9 @@
-# cronsrc
+# crontabctl
 
 A crontab compiler and daemon for macOS that adds timezone awareness, solar events,
 and irrational-interval sampling to standard cron.
 
-`cronsrc` maintains a richer source file (`~/.crontab_src`) and compiles it to a
+`crontabctl` maintains a richer source file (`~/.crontab.in`) and compiles it to a
 standard crontab. Run as a daemon it watches the source file with kqueue and
 recompiles immediately on changes, keeping cron's schedule current without polling.
 
@@ -22,15 +22,15 @@ recompiles immediately on changes, keeping cron's schedule current without polli
 ## Installation
 
 ```bash
-cp cronsrc.py ~/.local/bin/cronsrc
-chmod +x ~/.local/bin/cronsrc
+cp cronsrc.py ~/.local/bin/crontabctl
+chmod +x ~/.local/bin/crontabctl
 ```
 
-Create `~/.crontab_src` (see format below), then:
+Create `~/.crontab.in` (see format below), then:
 
 ```bash
-cronsrc --dry-run   # preview generated crontab
-cronsrc             # compile and install
+crontabctl --dry-run   # preview generated crontab
+crontabctl             # compile and install
 ```
 
 ## Running as a daemon
@@ -38,18 +38,18 @@ cronsrc             # compile and install
 Add to `~/.zlogin` (or any login-time shell file):
 
 ```zsh
-_cs_pid="$HOME/.local/share/cronsrc/daemon.pid"
-if ! { [[ -f "$_cs_pid" ]] && kill -0 "$(<$_cs_pid)" 2>/dev/null; }; then
-    cronsrc --daemon >> "$HOME/log/cronsrc.log" 2>&1
+_ct_pid="$HOME/.local/share/crontabctl/loop.pid"
+if ! { [[ -f "$_ct_pid" ]] && kill -0 "$(<$_ct_pid)" 2>/dev/null; }; then
+    crontabctl --daemon >> "$HOME/log/crontabctl.log" 2>&1
 fi
-unset _cs_pid
+unset _ct_pid
 ```
 
 `--daemon` forks, creates a new session, and writes its PID to
-`~/.local/share/cronsrc/daemon.pid`. It then loops:
+`~/.local/share/crontabctl/loop.pid`. It then loops:
 
 1. Compile and install the crontab.
-2. Watch `~/.crontab_src` with kqueue — recompile immediately on any write.
+2. Watch `~/.crontab.in` with kqueue — recompile immediately on any write.
 3. After 24 hours, recompile to refresh solar times and irrational-interval phases.
 
 `--loop` runs the same cycle without forking (useful when backgrounding externally).
@@ -144,6 +144,9 @@ times drift by `N mod 1440` minutes per day across recompiles.
 the day by a fixed amount on each recompile, covering different hours across multiple
 days deterministically. Unlike jitter, the times are reproducible from the epoch.
 
+Use `--reset-epoch` to advance each inline epoch to the last actual firing time,
+keeping the source file current without changing the firing phase.
+
 ### Day filters
 
 ```
@@ -172,12 +175,17 @@ in a Python guard that exits 0 silently on non-matching days.
 
 | Flag | Description |
 |---|---|
-| `--src PATH` | Source file (default `~/.crontab_src`) |
+| `--src PATH` | Source file (default `~/.crontab.in`) |
 | `--dry-run` | Print generated crontab, do not install |
+| `-e`, `--edit` | Open source in `$VISUAL`/`$EDITOR` (atomic write), then recompile |
+| `--reset-epoch` | Advance each `/Nm` inline-date epoch to the last actual firing, then recompile |
 | `--loop` | Compile then loop in-process |
 | `--daemon` | Fork+setsid, write PID, then loop |
 
-## Example `~/.crontab_src`
+`--edit` and `--reset-epoch` are daemon-aware: if the daemon is already running it
+will recompile automatically (via kqueue); otherwise the compile happens inline.
+
+## Example `~/.crontab.in`
 
 ```
 PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin
@@ -200,5 +208,5 @@ sunrise-30-sunset+60/1h  * * *  python3 ~/bin/hourly.py >> ~/log/hourly.log 2>&1
 # filter: none
 # tz: local
 # recompile daily to keep solar times and interval phases current
-03:01~10  * * *  cronsrc >> ~/log/cronsrc.log 2>&1
+03:01~10  * * *  crontabctl >> ~/log/crontabctl.log 2>&1
 ```
